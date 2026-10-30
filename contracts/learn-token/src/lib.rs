@@ -3,11 +3,11 @@
 mod events;
 mod storage;
 
-use chainlearn_shared::{BASE_REWARD_PER_POINT, MAX_QUIZ_SCORE};
 pub use chainlearn_shared::TOKEN_DECIMALS;
+use chainlearn_shared::{BASE_REWARD_PER_POINT, MAX_QUIZ_SCORE};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, BytesN, Env,
-    IntoVal, String as SorobanString, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, IntoVal,
+    String as SorobanString, Symbol, Vec,
 };
 
 // Re-export governance/vesting/admin types so tests can use them.
@@ -44,6 +44,7 @@ pub enum ContractError {
     RewardAlreadyClaimed = 12,
     NotAuthorized = 13,
     InvalidMaxSupply = 14,
+    ArithmeticOverflow = 15,
 }
 
 /// Result of previewing a `claim_reward` call without executing it (#199, #214).
@@ -72,13 +73,6 @@ pub struct ClaimEstimate {
 pub struct LearnToken;
 
 impl LearnToken {
-    /// Panic if the contract is paused (#238).
-    fn require_not_paused(env: &Env) {
-        if storage::is_paused(env) {
-            panic!("contract is paused");
-        }
-    }
-
     /// Check if the contract is paused and return an error if so.
     fn ensure_not_paused(env: &Env) -> Result<(), ContractError> {
         if storage::is_paused(env) {
@@ -175,13 +169,19 @@ impl LearnToken {
     /// Must be called *before* balances are updated.  For `Cooldown`, call
     /// [`Self::record_transfer_timestamp`] *after* the transfer succeeds to
     /// latch the per-sender timestamp.
-    fn check_transfer_restriction(env: &Env, from: &Address, to: &Address, amount: i128) {
+    fn check_transfer_restriction(
+        env: &Env,
+        from: &Address,
+        to: &Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
         let restriction = storage::get_transfer_restriction(env);
         match restriction {
             storage::TransferRestriction::None => {}
             storage::TransferRestriction::WhitelistOnly => {
                 if !storage::is_whitelisted(env, to) {
-                    panic!("recipient not whitelisted");
+                    // recipient not on the transfer whitelist (NotAuthorized)
+                    return Err(ContractError::NotAuthorized);
                 }
             }
             storage::TransferRestriction::Cooldown(cooldown_ledgers) => {
@@ -190,16 +190,19 @@ impl LearnToken {
                 if let Some(last_ledger) = storage::get_last_transfer_ledger(env, from) {
                     let current = env.ledger().sequence();
                     if current < last_ledger + cooldown_ledgers {
-                        panic!("cooldown period active");
+                        // cooldown period still active (mapped to ContractPaused)
+                        return Err(ContractError::ContractPaused);
                     }
                 }
             }
             storage::TransferRestriction::MaxAmount(max) => {
                 if amount > max {
-                    panic!("transfer amount exceeds maximum");
+                    // transfer amount exceeds the configured maximum (MaxSupplyExceeded)
+                    return Err(ContractError::MaxSupplyExceeded);
                 }
             }
         }
+        Ok(())
     }
 
     /// Record the current ledger as the sender's most recent transfer ledger.
@@ -221,28 +224,36 @@ impl LearnToken {
     ///
     /// # Arguments
     /// * `restriction` - The new restriction to apply
-    pub fn set_transfer_restriction(env: Env, restriction: storage::TransferRestriction) {
-        Self::require_not_paused(&env);
+    pub fn set_transfer_restriction(
+        env: Env,
+        restriction: storage::TransferRestriction,
+    ) -> Result<(), ContractError> {
+        Self::ensure_not_paused(&env)?;
         let admin = storage::get_admin(&env);
         admin.require_auth();
         if restriction == storage::TransferRestriction::WhitelistOnly {
             Self::stage_whitelist_restriction(&env, &restriction);
-            return;
+            return Ok(());
         }
         storage::clear_pending_transfer_restriction(&env);
         storage::set_transfer_restriction(&env, &restriction);
         events::restriction_updated(&env, &restriction);
+        Ok(())
     }
 
     /// Explicitly propose the whitelist-only restriction. It becomes active
     /// only after the fixed 48-hour safety delay and a second admin action.
-    pub fn propose_transfer_restriction(env: Env, restriction: storage::TransferRestriction) {
+    pub fn propose_transfer_restriction(
+        env: Env,
+        restriction: storage::TransferRestriction,
+    ) -> Result<(), ContractError> {
         let admin = storage::get_admin(&env);
         admin.require_auth();
         if restriction != storage::TransferRestriction::WhitelistOnly {
-            panic!("only whitelist restriction requires a proposal");
+            return Err(ContractError::NotAuthorized); // only whitelist restriction requires a proposal
         }
         Self::stage_whitelist_restriction(&env, &restriction);
+        Ok(())
     }
 
     fn stage_whitelist_restriction(env: &Env, restriction: &storage::TransferRestriction) {
@@ -259,30 +270,32 @@ impl LearnToken {
     }
 
     /// Apply a proposed whitelist-only restriction after its safety delay.
-    pub fn accept_transfer_restriction(env: Env) {
+    pub fn accept_transfer_restriction(env: Env) -> Result<(), ContractError> {
         let admin = storage::get_admin(&env);
         admin.require_auth();
-        let pending = storage::get_pending_transfer_restriction(&env)
-            .expect("no pending transfer restriction");
+        let pending =
+            storage::get_pending_transfer_restriction(&env).ok_or(ContractError::NotAuthorized)?; // no pending transfer restriction
         let effective_at = pending
             .initiated_at
             .saturating_add(storage::TRANSFER_RESTRICTION_DELAY_SECONDS);
         if env.ledger().timestamp() < effective_at {
-            panic!("transfer restriction delay has not elapsed");
+            return Err(ContractError::ExpirationInPast); // delay has not elapsed
         }
         storage::set_transfer_restriction(&env, &pending.restriction);
         storage::clear_pending_transfer_restriction(&env);
         events::restriction_updated(&env, &pending.restriction);
+        Ok(())
     }
 
     /// Cancel a staged whitelist-only restriction before it becomes active.
-    pub fn cancel_transfer_restriction(env: Env) {
+    pub fn cancel_transfer_restriction(env: Env) -> Result<(), ContractError> {
         let admin = storage::get_admin(&env);
         admin.require_auth();
         if storage::get_pending_transfer_restriction(&env).is_none() {
-            panic!("no pending transfer restriction");
+            return Err(ContractError::NotAuthorized); // no pending transfer restriction
         }
         storage::clear_pending_transfer_restriction(&env);
+        Ok(())
     }
 
     /// Return a staged whitelist-only restriction, if any.
@@ -299,26 +312,29 @@ impl LearnToken {
     ///
     /// # Arguments
     /// * `address` - The address to whitelist
-    pub fn add_to_whitelist(env: Env, address: Address) {
-        Self::require_not_paused(&env);
+    pub fn add_to_whitelist(env: Env, address: Address) -> Result<(), ContractError> {
+        Self::ensure_not_paused(&env)?;
         let admin = storage::get_admin(&env);
         admin.require_auth();
         storage::add_to_whitelist(&env, &address);
         events::whitelist_updated(&env, &address, true);
+        Ok(())
     }
 
     /// Remove an address from the transfer whitelist. Admin only.
     ///
-    /// Panics if the address is not currently whitelisted.
-    ///
     /// # Arguments
     /// * `address` - The address to remove from the whitelist
-    pub fn remove_from_whitelist(env: Env, address: Address) {
-        Self::require_not_paused(&env);
+    pub fn remove_from_whitelist(env: Env, address: Address) -> Result<(), ContractError> {
+        Self::ensure_not_paused(&env)?;
         let admin = storage::get_admin(&env);
         admin.require_auth();
+        if !storage::is_whitelisted(&env, &address) {
+            return Err(ContractError::NotAuthorized); // address not whitelisted
+        }
         storage::remove_from_whitelist(&env, &address);
         events::whitelist_updated(&env, &address, false);
+        Ok(())
     }
 
     /// Check if an address is on the transfer whitelist.
@@ -348,14 +364,15 @@ impl LearnToken {
     /// Use the same `ledger_height` in all three steps, and record balances
     /// before they change: the value stored is the balance at the time of the
     /// `record_balance_snapshot` call, not at `ledger_height`.
-    pub fn snapshot(env: Env, ledger_height: u32) {
-        Self::require_not_paused(&env);
+    pub fn snapshot(env: Env, ledger_height: u32) -> Result<(), ContractError> {
+        Self::ensure_not_paused(&env)?;
         let admin = storage::get_admin(&env);
         admin.require_auth();
         if ledger_height != env.ledger().sequence() {
-            panic!("snapshot ledger must match the current ledger");
+            return Err(ContractError::ExpirationInPast); // snapshot ledger must match current
         }
         events::snapshot_created(&env, ledger_height);
+        Ok(())
     }
 
     /// Get the balance of an address recorded under a snapshot ledger height.
@@ -381,15 +398,20 @@ impl LearnToken {
     /// to be able to read that address's balance back with
     /// [`Self::balance_at`]. Calling it again for the same address and height
     /// overwrites the stored value with the then-current balance.
-    pub fn record_balance_snapshot(env: Env, address: Address, ledger_height: u32) {
-        Self::require_not_paused(&env);
+    pub fn record_balance_snapshot(
+        env: Env,
+        address: Address,
+        ledger_height: u32,
+    ) -> Result<(), ContractError> {
+        Self::ensure_not_paused(&env)?;
         let admin = storage::get_admin(&env);
         admin.require_auth();
         if ledger_height != env.ledger().sequence() {
-            panic!("snapshot ledger must match the current ledger");
+            return Err(ContractError::ExpirationInPast); // snapshot ledger must match current
         }
         let balance = storage::get_balance(&env, &address);
         storage::set_snapshot_balance(&env, &address, ledger_height, balance);
+        Ok(())
     }
 
     /// Prune old snapshot balance entries created before `older_than_ledger`. Admin only.
@@ -399,12 +421,12 @@ impl LearnToken {
     ///
     /// # Returns
     /// The number of snapshot balance entries removed.
-    pub fn prune_snapshots(env: Env, older_than_ledger: u32) -> u32 {
+    pub fn prune_snapshots(env: Env, older_than_ledger: u32) -> Result<u32, ContractError> {
         let admin = storage::get_admin(&env);
         admin.require_auth();
         let removed = storage::prune_snapshots(&env, older_than_ledger);
         events::snapshots_pruned(&env, older_than_ledger, removed);
-        removed
+        Ok(removed)
     }
 
     // ── SEP-41 Standard Interface ─────────────────────────────────────────
@@ -476,44 +498,56 @@ impl LearnToken {
     /// * `from` - Source address (must authorize)
     /// * `to` - Destination address
     /// * `amount` - Amount to transfer
-    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
-        Self::require_not_paused(&env);
+    pub fn transfer(
+        env: Env,
+        from: Address,
+        to: Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        Self::ensure_not_paused(&env)?;
         from.require_auth();
 
         if from == to {
-            panic_with_error!(&env, ContractError::TransferToSelf);
+            return Err(ContractError::TransferToSelf);
         }
 
         // Prevent transfers to the contract itself, which would lock tokens
         // irretrievably (#76).
         if to == env.current_contract_address() {
-            panic_with_error!(&env, ContractError::TransferToContract);
+            return Err(ContractError::TransferToContract);
         }
 
         if amount < 0 {
-            panic_with_error!(&env, ContractError::NegativeAmount);
+            return Err(ContractError::NegativeAmount);
         }
 
         if amount == 0 {
-            return;
+            return Ok(());
         }
 
         let from_balance = storage::get_balance(&env, &from);
         if from_balance < amount {
-            panic_with_error!(&env, ContractError::InsufficientBalance);
+            return Err(ContractError::InsufficientBalance);
         }
 
         // Check transfer restrictions (#191)
-        Self::check_transfer_restriction(&env, &from, &to, amount);
+        Self::check_transfer_restriction(&env, &from, &to, amount)?;
 
-        storage::set_balance(&env, &from, from_balance - amount);
+        let updated_from_balance = from_balance
+            .checked_sub(amount)
+            .ok_or(ContractError::ArithmeticOverflow)?;
         let to_balance = storage::get_balance(&env, &to);
-        storage::set_balance(&env, &to, to_balance + amount);
+        let updated_to_balance = to_balance
+            .checked_add(amount)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+        storage::set_balance(&env, &from, updated_from_balance);
+        storage::set_balance(&env, &to, updated_to_balance);
 
         // Latch the per-sender cooldown timestamp after a successful transfer.
         Self::record_transfer_timestamp(&env, &from);
 
         events::transfer(&env, &from, &to, amount);
+        Ok(())
     }
 
     /// Transfer tokens on behalf of another address.
@@ -523,26 +557,32 @@ impl LearnToken {
     /// * `from` - Source address
     /// * `to` - Destination address
     /// * `amount` - Amount to transfer
-    pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
-        Self::require_not_paused(&env);
+    pub fn transfer_from(
+        env: Env,
+        spender: Address,
+        from: Address,
+        to: Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        Self::ensure_not_paused(&env)?;
         spender.require_auth();
 
         if from == to {
-            panic_with_error!(&env, ContractError::TransferToSelf);
+            return Err(ContractError::TransferToSelf);
         }
 
         // Prevent transfers to the contract itself, which would lock tokens
         // irretrievably (#76).
         if to == env.current_contract_address() {
-            panic_with_error!(&env, ContractError::TransferToContract);
+            return Err(ContractError::TransferToContract);
         }
 
         if amount < 0 {
-            panic_with_error!(&env, ContractError::NegativeAmount);
+            return Err(ContractError::NegativeAmount);
         }
 
         if amount == 0 {
-            return;
+            return Ok(());
         }
 
         let (exists, is_expired, expiration_ledger) =
@@ -553,26 +593,34 @@ impl LearnToken {
 
         let allowance = storage::get_allowance(&env, &from, &spender);
         if allowance < amount {
-            panic_with_error!(&env, ContractError::InsufficientAllowance);
+            return Err(ContractError::InsufficientAllowance);
         }
 
         let from_balance = storage::get_balance(&env, &from);
         if from_balance < amount {
-            panic_with_error!(&env, ContractError::InsufficientBalance);
+            return Err(ContractError::InsufficientBalance);
         }
 
         // Check transfer restrictions (#191)
-        Self::check_transfer_restriction(&env, &from, &to, amount);
+        Self::check_transfer_restriction(&env, &from, &to, amount)?;
+
+        let updated_from_balance = from_balance
+            .checked_sub(amount)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+        let to_balance = storage::get_balance(&env, &to);
+        let updated_to_balance = to_balance
+            .checked_add(amount)
+            .ok_or(ContractError::ArithmeticOverflow)?;
 
         storage::reduce_allowance(&env, &from, &spender, amount);
-        storage::set_balance(&env, &from, from_balance - amount);
-        let to_balance = storage::get_balance(&env, &to);
-        storage::set_balance(&env, &to, to_balance + amount);
+        storage::set_balance(&env, &from, updated_from_balance);
+        storage::set_balance(&env, &to, updated_to_balance);
 
         // Latch the per-sender cooldown timestamp after a successful transfer.
         Self::record_transfer_timestamp(&env, &from);
 
         events::transfer_from(&env, &spender, &from, &to, amount);
+        Ok(())
     }
 
     /// Approve a spender to spend tokens on behalf of the caller.
@@ -588,20 +636,21 @@ impl LearnToken {
         spender: Address,
         amount: i128,
         expiration_ledger: u32,
-    ) {
+    ) -> Result<(), ContractError> {
         owner.require_auth();
 
         if amount < 0 {
-            panic_with_error!(&env, ContractError::NegativeAmount);
+            return Err(ContractError::NegativeAmount);
         }
 
         if expiration_ledger <= env.ledger().sequence() {
-            panic_with_error!(&env, ContractError::ExpirationInPast);
+            return Err(ContractError::ExpirationInPast);
         }
 
         storage::set_allowance(&env, &owner, &spender, amount, expiration_ledger);
         storage::track_allowance_spender(&env, &owner, &spender);
         events::approve(&env, &owner, &spender, amount, expiration_ledger);
+        Ok(())
     }
 
     /// Returns the allowance for a spender on behalf of an owner.
@@ -627,17 +676,17 @@ impl LearnToken {
     /// # Panics
     /// * If `amount` is negative
     /// * If `from` holds less than `amount`
-    pub fn burn(env: Env, from: Address, amount: i128) {
-        Self::require_not_paused(&env);
+    pub fn burn(env: Env, from: Address, amount: i128) -> Result<(), ContractError> {
+        Self::ensure_not_paused(&env)?;
         from.require_auth();
 
         if amount < 0 {
-            panic_with_error!(&env, ContractError::NegativeAmount);
+            return Err(ContractError::NegativeAmount);
         }
 
         let from_balance = storage::get_balance(&env, &from);
         if from_balance < amount {
-            panic_with_error!(&env, ContractError::InsufficientBalance);
+            return Err(ContractError::InsufficientBalance);
         }
 
         storage::set_balance(&env, &from, from_balance - amount);
@@ -648,6 +697,7 @@ impl LearnToken {
         storage::set_total_supply(&env, current_supply - amount);
 
         events::burn(&env, &from, amount);
+        Ok(())
     }
 
     /// Burn tokens on behalf of an owner, drawing on an approved allowance.
@@ -664,12 +714,17 @@ impl LearnToken {
     /// * If `amount` is negative
     /// * If the spender's allowance is below `amount`
     /// * If `from` holds less than `amount`
-    pub fn burn_from(env: Env, spender: Address, from: Address, amount: i128) {
-        Self::require_not_paused(&env);
+    pub fn burn_from(
+        env: Env,
+        spender: Address,
+        from: Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        Self::ensure_not_paused(&env)?;
         spender.require_auth();
 
         if amount < 0 {
-            panic_with_error!(&env, ContractError::NegativeAmount);
+            return Err(ContractError::NegativeAmount);
         }
 
         // Surface an expired allowance the same way transfer_from does, so
@@ -682,12 +737,12 @@ impl LearnToken {
 
         let allowance = storage::get_allowance(&env, &from, &spender);
         if allowance < amount {
-            panic_with_error!(&env, ContractError::InsufficientAllowance);
+            return Err(ContractError::InsufficientAllowance);
         }
 
         let from_balance = storage::get_balance(&env, &from);
         if from_balance < amount {
-            panic_with_error!(&env, ContractError::InsufficientBalance);
+            return Err(ContractError::InsufficientBalance);
         }
 
         storage::reduce_allowance(&env, &from, &spender, amount);
@@ -697,6 +752,7 @@ impl LearnToken {
         storage::set_total_supply(&env, current_supply - amount);
 
         events::burn_from(&env, &spender, &from, amount);
+        Ok(())
     }
 
     // ── Minting (Admin Only) ──────────────────────────────────────────────
@@ -706,24 +762,24 @@ impl LearnToken {
     /// # Arguments
     /// * `to` - Recipient address
     /// * `amount` - Amount to mint
-    pub fn mint(env: Env, caller: Address, to: Address, amount: i128) {
-        Self::require_not_paused(&env);
+    pub fn mint(env: Env, caller: Address, to: Address, amount: i128) -> Result<(), ContractError> {
+        Self::ensure_not_paused(&env)?;
         caller.require_auth();
         if !storage::has_role(&env, &caller, &storage::AdminRole::Minter) {
-            panic_with_error!(&env, ContractError::NotAuthorized);
+            return Err(ContractError::NotAuthorized);
         }
 
         let zero_address = chainlearn_shared::zero_address(&env);
         if to == zero_address {
-            panic!("cannot mint to zero address");
+            return Err(ContractError::ZeroAddress);
         }
 
         if amount < 0 {
-            panic_with_error!(&env, ContractError::NegativeAmount);
+            return Err(ContractError::NegativeAmount);
         }
 
         if amount == 0 {
-            return;
+            return Ok(());
         }
 
         let current_supply = storage::get_total_supply(&env);
@@ -732,7 +788,7 @@ impl LearnToken {
             .checked_add(amount)
             .map_or(true, |s| s > max_supply)
         {
-            panic!("maximum supply cap exceeded");
+            return Err(ContractError::MaxSupplyExceeded);
         }
 
         let current_balance = storage::get_balance(&env, &to);
@@ -744,6 +800,7 @@ impl LearnToken {
         storage::add_total_minted_to(&env, &to, amount);
 
         events::mint(&env, &to, amount);
+        Ok(())
     }
 
     // ── ChainLearn Reward Logic ───────────────────────────────────────────
@@ -758,12 +815,17 @@ impl LearnToken {
     /// * `learner` - The learner claiming the reward (must authorize)
     /// * `course_id` - The course the quiz belongs to
     /// * `quiz_id` - Unique identifier for the quiz
-    pub fn claim_reward(env: Env, learner: Address, course_id: Symbol, quiz_id: Symbol) {
-        Self::require_not_paused(&env);
+    pub fn claim_reward(
+        env: Env,
+        learner: Address,
+        course_id: Symbol,
+        quiz_id: Symbol,
+    ) -> Result<(), ContractError> {
+        Self::ensure_not_paused(&env)?;
         learner.require_auth();
 
         if storage::is_reward_claimed(&env, &learner, &course_id, &quiz_id) {
-            panic_with_error!(&env, ContractError::RewardAlreadyClaimed);
+            return Err(ContractError::RewardAlreadyClaimed);
         }
 
         // Verify score by querying the progress-tracker contract via a single
@@ -779,19 +841,21 @@ impl LearnToken {
         );
 
         if score == 0 {
-            panic!("score must be greater than 0");
+            return Err(ContractError::InvalidScore);
         }
 
         if score > MAX_QUIZ_SCORE {
-            panic_with_error!(&env, ContractError::InvalidScore);
+            return Err(ContractError::InvalidScore);
         }
 
-        let reward_amount = (score as i128) * BASE_REWARD_PER_POINT;
+        let reward_amount = (score as i128)
+            .checked_mul(BASE_REWARD_PER_POINT)
+            .ok_or(ContractError::ArithmeticOverflow)?;
 
         // Cap the maximum reward to prevent excessively large minting if
         // MAX_QUIZ_SCORE or BASE_REWARD_PER_POINT change in the future (#78).
         if reward_amount > MAX_REWARD_AMOUNT {
-            panic!("reward exceeds cap");
+            return Err(ContractError::RewardCapped);
         }
 
         // Check max_supply cap before minting (#178)
@@ -801,14 +865,20 @@ impl LearnToken {
             .checked_add(reward_amount)
             .map_or(true, |s| s > max_supply)
         {
-            panic!("maximum supply cap exceeded");
+            return Err(ContractError::MaxSupplyExceeded);
         }
 
         // Mint tokens to the learner
         let current_balance = storage::get_balance(&env, &learner);
-        storage::set_balance(&env, &learner, current_balance + reward_amount);
+        let updated_balance = current_balance
+            .checked_add(reward_amount)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+        let updated_supply = current_supply
+            .checked_add(reward_amount)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+        storage::set_balance(&env, &learner, updated_balance);
 
-        storage::set_total_supply(&env, current_supply + reward_amount);
+        storage::set_total_supply(&env, updated_supply);
 
         // Reward claims mint too, so they count toward the per-address
         // minted total (#236).
@@ -830,6 +900,7 @@ impl LearnToken {
         );
 
         events::reward_claimed(&env, &learner, &quiz_id, score, reward_amount, &course_id);
+        Ok(())
     }
 
     /// Claim token rewards for completing multiple quizzes in a batch.
@@ -850,8 +921,8 @@ impl LearnToken {
         learner: Address,
         course_id: Symbol,
         quiz_ids: soroban_sdk::Vec<Symbol>,
-    ) -> soroban_sdk::Vec<Symbol> {
-        Self::require_not_paused(&env);
+    ) -> Result<soroban_sdk::Vec<Symbol>, ContractError> {
+        Self::ensure_not_paused(&env)?;
         learner.require_auth();
 
         let mut successful = soroban_sdk::Vec::new(&env);
@@ -889,21 +960,27 @@ impl LearnToken {
                 continue;
             }
 
-            let reward_amount = (score as i128) * BASE_REWARD_PER_POINT;
+            let Some(reward_amount) = (score as i128).checked_mul(BASE_REWARD_PER_POINT) else {
+                continue;
+            };
             if reward_amount > MAX_REWARD_AMOUNT {
                 continue;
             }
 
-            if current_supply
-                .checked_add(reward_amount)
-                .map_or(true, |s| s > max_supply)
-            {
+            let (Some(next_supply), Some(next_balance), Some(next_total_minted)) = (
+                current_supply.checked_add(reward_amount),
+                current_balance.checked_add(reward_amount),
+                total_minted.checked_add(reward_amount),
+            ) else {
+                continue;
+            };
+            if next_supply > max_supply {
                 continue;
             }
 
-            current_supply += reward_amount;
-            current_balance += reward_amount;
-            total_minted += reward_amount;
+            current_supply = next_supply;
+            current_balance = next_balance;
+            total_minted = next_total_minted;
 
             storage::set_reward_claimed(&env, &learner, &course_id, &quiz_id);
             storage::append_claim_record(
@@ -926,7 +1003,7 @@ impl LearnToken {
             storage::add_total_minted_to(&env, &learner, total_minted);
         }
 
-        successful
+        Ok(successful)
     }
 
     /// Preview a `claim_reward` call without executing it or changing any
@@ -1009,53 +1086,75 @@ impl LearnToken {
     // ── Admin ─────────────────────────────────────────────────────────────
 
     /// Grant an admin role to an address. Admin only.
-    pub fn grant_role(env: Env, caller: Address, address: Address, role: storage::AdminRole) {
-        Self::require_not_paused(&env);
+    pub fn grant_role(
+        env: Env,
+        caller: Address,
+        address: Address,
+        role: storage::AdminRole,
+    ) -> Result<(), ContractError> {
+        Self::ensure_not_paused(&env)?;
         caller.require_auth();
         if !storage::has_role(&env, &caller, &storage::AdminRole::Admin) {
-            panic_with_error!(&env, ContractError::NotAuthorized);
+            return Err(ContractError::NotAuthorized);
         }
         storage::add_admin(&env, &address, &role);
         events::role_granted(&env, &address, &role);
+        Ok(())
     }
 
     /// Revoke an admin role from an address. Admin only.
-    pub fn revoke_role(env: Env, caller: Address, address: Address, role: storage::AdminRole) {
-        Self::require_not_paused(&env);
+    pub fn revoke_role(
+        env: Env,
+        caller: Address,
+        address: Address,
+        role: storage::AdminRole,
+    ) -> Result<(), ContractError> {
+        Self::ensure_not_paused(&env)?;
         caller.require_auth();
         if !storage::has_role(&env, &caller, &storage::AdminRole::Admin) {
-            panic_with_error!(&env, ContractError::NotAuthorized);
+            return Err(ContractError::NotAuthorized);
         }
         storage::remove_admin(&env, &address, &role);
         events::role_revoked(&env, &address, &role);
+        Ok(())
     }
 
     /// Add a new admin with a specific role (#212).
     ///
     /// Requires authorization from an existing Admin.
-    pub fn add_admin(env: Env, caller: Address, admin_info: AdminInfo) {
-        Self::require_not_paused(&env);
+    pub fn add_admin(
+        env: Env,
+        caller: Address,
+        admin_info: AdminInfo,
+    ) -> Result<(), ContractError> {
+        Self::ensure_not_paused(&env)?;
         caller.require_auth();
         if !storage::has_role(&env, &caller, &storage::AdminRole::Admin) {
-            panic_with_error!(&env, ContractError::NotAuthorized);
+            return Err(ContractError::NotAuthorized);
         }
 
         storage::add_admin(&env, &admin_info.address, &admin_info.role);
         events::role_granted(&env, &admin_info.address, &admin_info.role);
+        Ok(())
     }
 
     /// Remove an admin and revoke their role (#212).
     ///
     /// Requires authorization from an existing Admin.
-    pub fn remove_admin(env: Env, caller: Address, admin_info: AdminInfo) {
-        Self::require_not_paused(&env);
+    pub fn remove_admin(
+        env: Env,
+        caller: Address,
+        admin_info: AdminInfo,
+    ) -> Result<(), ContractError> {
+        Self::ensure_not_paused(&env)?;
         caller.require_auth();
         if !storage::has_role(&env, &caller, &storage::AdminRole::Admin) {
-            panic_with_error!(&env, ContractError::NotAuthorized);
+            return Err(ContractError::NotAuthorized);
         }
 
         storage::remove_admin(&env, &admin_info.address, &admin_info.role);
         events::role_revoked(&env, &admin_info.address, &admin_info.role);
+        Ok(())
     }
 
     /// Get the list of all registered admins and their roles (#212).
@@ -1064,24 +1163,30 @@ impl LearnToken {
     }
 
     /// Perform a critical operation requiring multi-sig authorization from two admins (#212).
-    pub fn execute_multisig_op(env: Env, caller: Address, co_signer: Address, operation: Symbol) {
+    pub fn execute_multisig_op(
+        env: Env,
+        caller: Address,
+        co_signer: Address,
+        operation: Symbol,
+    ) -> Result<(), ContractError> {
         caller.require_auth();
         co_signer.require_auth();
 
         if caller == co_signer {
-            panic!("distinct co-signer required");
+            return Err(ContractError::NotAuthorized); // distinct co-signer required
         }
 
         if !storage::has_role(&env, &caller, &storage::AdminRole::Admin)
             || !storage::has_role(&env, &co_signer, &storage::AdminRole::Admin)
         {
-            panic_with_error!(&env, ContractError::NotAuthorized);
+            return Err(ContractError::NotAuthorized);
         }
 
         env.events().publish(
             (Symbol::new(&env, "multisig_op_executed"),),
             (&caller, &co_signer, &operation),
         );
+        Ok(())
     }
 
     /// Upgrade contract wasm code with multi-sig authorization (#212, #213).
@@ -1090,18 +1195,18 @@ impl LearnToken {
         caller: Address,
         co_signer: Address,
         new_wasm_hash: BytesN<32>,
-    ) {
+    ) -> Result<(), ContractError> {
         caller.require_auth();
         co_signer.require_auth();
 
         if caller == co_signer {
-            panic!("distinct co-signer required");
+            return Err(ContractError::NotAuthorized); // distinct co-signer required
         }
 
         if !storage::has_role(&env, &caller, &storage::AdminRole::Admin)
             || !storage::has_role(&env, &co_signer, &storage::AdminRole::Admin)
         {
-            panic_with_error!(&env, ContractError::NotAuthorized);
+            return Err(ContractError::NotAuthorized);
         }
 
         env.deployer()
@@ -1110,6 +1215,7 @@ impl LearnToken {
         let version = storage::increment_upgrade_version(&env);
 
         events::upgraded(&env, &new_wasm_hash, version);
+        Ok(())
     }
 
     /// Check if an address has a specific role.
@@ -1136,33 +1242,35 @@ impl LearnToken {
     // ── Pause Controls (Admin Only) ───────────────────────────────────────
 
     /// Pause the contract. Admin or Pauser only (#238, #189).
-    pub fn pause(env: Env, caller: Address) {
+    pub fn pause(env: Env, caller: Address) -> Result<(), ContractError> {
         caller.require_auth();
         if !storage::has_role(&env, &caller, &storage::AdminRole::Pauser) {
-            panic_with_error!(&env, ContractError::NotAuthorized);
+            return Err(ContractError::NotAuthorized);
         }
 
         if storage::is_paused(&env) {
-            panic!("already paused");
+            return Err(ContractError::AlreadyInitialized); // already paused
         }
 
         storage::set_paused(&env, true);
         events::paused(&env, &caller, env.ledger().timestamp());
+        Ok(())
     }
 
     /// Unpause the contract. Admin or Pauser only (#238, #189).
-    pub fn unpause(env: Env, caller: Address) {
+    pub fn unpause(env: Env, caller: Address) -> Result<(), ContractError> {
         caller.require_auth();
         if !storage::has_role(&env, &caller, &storage::AdminRole::Pauser) {
-            panic_with_error!(&env, ContractError::NotAuthorized);
+            return Err(ContractError::NotAuthorized);
         }
 
         if !storage::is_paused(&env) {
-            panic!("not paused");
+            return Err(ContractError::AlreadyInitialized); // not paused
         }
 
         storage::set_paused(&env, false);
         events::unpaused(&env, &caller, env.ledger().timestamp());
+        Ok(())
     }
 
     /// Returns whether the contract is currently paused (#238).
@@ -1295,13 +1403,13 @@ impl LearnToken {
     /// # Panics
     /// * If the caller is not the current admin
     /// * If `new_admin` is the zero address
-    pub fn transfer_admin(env: Env, new_admin: Address) {
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), ContractError> {
         let admin = storage::get_admin(&env);
         admin.require_auth();
 
         let zero_address = chainlearn_shared::zero_address(&env);
         if new_admin == zero_address {
-            panic!("cannot transfer admin to zero address");
+            return Err(ContractError::ZeroAddress);
         }
 
         let initiated_at = env.ledger().timestamp();
@@ -1321,6 +1429,7 @@ impl LearnToken {
             initiated_at,
             initiated_at.saturating_add(delay),
         );
+        Ok(())
     }
 
     /// Complete a pending admin transfer once its delay has elapsed (#241).
@@ -1334,14 +1443,14 @@ impl LearnToken {
     /// * If the caller is not the pending `new_admin`
     /// * If [`Self::admin_transfer_delay`] has not yet elapsed since
     ///   `transfer_admin` was called
-    pub fn accept_admin(env: Env) {
-        let pending = storage::get_pending_admin(&env).expect("no pending admin transfer");
+    pub fn accept_admin(env: Env) -> Result<(), ContractError> {
+        let pending = storage::get_pending_admin(&env).ok_or(ContractError::NotAuthorized)?; // no pending admin transfer
         pending.new_admin.require_auth();
 
         let delay = storage::get_admin_transfer_delay(&env);
         let ready_at = pending.initiated_at.saturating_add(delay);
         if env.ledger().timestamp() < ready_at {
-            panic!("admin transfer delay has not elapsed");
+            return Err(ContractError::ExpirationInPast); // delay not elapsed
         }
 
         let previous_admin = storage::get_admin(&env);
@@ -1349,6 +1458,7 @@ impl LearnToken {
         storage::clear_pending_admin(&env);
 
         events::admin_transfer_accepted(&env, &previous_admin, &pending.new_admin);
+        Ok(())
     }
 
     /// Cancel a pending admin transfer before it is accepted (#241).
@@ -1360,14 +1470,15 @@ impl LearnToken {
     /// # Panics
     /// * If the caller is not the current admin
     /// * If there is no pending admin transfer
-    pub fn cancel_admin_transfer(env: Env) {
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), ContractError> {
         let admin = storage::get_admin(&env);
         admin.require_auth();
 
-        let pending = storage::get_pending_admin(&env).expect("no pending admin transfer");
+        let pending = storage::get_pending_admin(&env).ok_or(ContractError::NotAuthorized)?; // no pending admin transfer
         storage::clear_pending_admin(&env);
 
         events::admin_transfer_cancelled(&env, &admin, &pending.new_admin);
+        Ok(())
     }
 
     /// Returns the in-flight pending admin transfer, if any (#241).
@@ -1384,20 +1495,18 @@ impl LearnToken {
     ///
     /// Applies to transfers initiated after this call; it does not change
     /// the deadline of a transfer already pending.
-    ///
-    /// # Panics
-    /// * If the caller is not the current admin
-    pub fn set_admin_transfer_delay(env: Env, delay_seconds: u64) {
+    pub fn set_admin_transfer_delay(env: Env, delay_seconds: u64) -> Result<(), ContractError> {
         let admin = storage::get_admin(&env);
         admin.require_auth();
         if delay_seconds < storage::MIN_ADMIN_TRANSFER_DELAY_SECONDS {
-            panic!("admin transfer delay is below the minimum");
+            return Err(ContractError::NegativeAmount); // below minimum delay
         }
 
         let old_delay = storage::get_admin_transfer_delay(&env);
         storage::set_admin_transfer_delay(&env, delay_seconds);
 
         events::admin_transfer_delay_updated(&env, old_delay, delay_seconds);
+        Ok(())
     }
 
     /// Update the progress-tracker contract address. Admin only.
@@ -1408,11 +1517,15 @@ impl LearnToken {
     ///
     /// # Arguments
     /// * `new_progress_tracker` - The new progress-tracker contract address
-    pub fn set_progress_tracker(env: Env, new_progress_tracker: Address) {
+    pub fn set_progress_tracker(
+        env: Env,
+        new_progress_tracker: Address,
+    ) -> Result<(), ContractError> {
         let admin = storage::get_admin(&env);
         admin.require_auth();
         storage::set_progress_tracker(&env, &new_progress_tracker);
         events::progress_tracker_updated(&env, &new_progress_tracker);
+        Ok(())
     }
 
     /// Increase the allowance for a spender (#77).
@@ -1433,7 +1546,7 @@ impl LearnToken {
         additional_amount: i128,
         expiration_ledger: u32,
     ) -> Result<(), ContractError> {
-        Self::require_not_paused(&env);
+        Self::ensure_not_paused(&env)?;
         owner.require_auth();
 
         if additional_amount < 0 {
@@ -1542,16 +1655,21 @@ impl LearnToken {
     /// * `owner` - Token owner (must authorize)
     /// * `spender` - Address whose allowance to decrease
     /// * `decrease_amount` - Amount to subtract from the current allowance
-    pub fn decrease_allowance(env: Env, owner: Address, spender: Address, decrease_amount: i128) {
+    pub fn decrease_allowance(
+        env: Env,
+        owner: Address,
+        spender: Address,
+        decrease_amount: i128,
+    ) -> Result<(), ContractError> {
         owner.require_auth();
 
         if decrease_amount < 0 {
-            panic_with_error!(&env, ContractError::NegativeAmount);
+            return Err(ContractError::NegativeAmount);
         }
 
         let current = storage::get_allowance(&env, &owner, &spender);
         if decrease_amount > current {
-            panic!("decrease exceeds allowance");
+            return Err(ContractError::InsufficientAllowance); // decrease exceeds allowance
         }
         let new_amount = current - decrease_amount;
         // Preserve existing expiration
@@ -1563,9 +1681,10 @@ impl LearnToken {
             .storage()
             .temporary()
             .get(&storage::TokenDataKey::Allowance(key.clone()))
-            .expect("allowance not set");
+            .ok_or(ContractError::InsufficientAllowance)?; // allowance not set
         storage::set_allowance(&env, &owner, &spender, new_amount, data.expiration_ledger);
         events::approve(&env, &owner, &spender, new_amount, data.expiration_ledger);
+        Ok(())
     }
 
     // ── Permit / Gasless Approvals (#224) ─────────────────────────────────
@@ -1593,26 +1712,27 @@ impl LearnToken {
         amount: i128,
         expiration_ledger: u32,
         nonce: u64,
-    ) {
+    ) -> Result<(), ContractError> {
         owner.require_auth();
 
         if amount < 0 {
-            panic_with_error!(&env, ContractError::NegativeAmount);
+            return Err(ContractError::NegativeAmount);
         }
 
         if expiration_ledger <= env.ledger().sequence() {
-            panic_with_error!(&env, ContractError::ExpirationInPast);
+            return Err(ContractError::ExpirationInPast);
         }
 
         let current_nonce = storage::get_permit_nonce(&env, &owner);
         if nonce != current_nonce {
-            panic!("invalid nonce");
+            return Err(ContractError::NotAuthorized); // invalid nonce
         }
 
         storage::increment_permit_nonce(&env, &owner);
         storage::set_allowance(&env, &owner, &spender, amount, expiration_ledger);
         storage::track_allowance_spender(&env, &owner, &spender);
         events::approve(&env, &owner, &spender, amount, expiration_ledger);
+        Ok(())
     }
 
     /// Returns the current permit nonce for `owner` (#224).
@@ -1645,25 +1765,25 @@ impl LearnToken {
         total_amount: i128,
         cliff_timestamp: u64,
         duration_seconds: u64,
-    ) {
-        Self::require_not_paused(&env);
+    ) -> Result<(), ContractError> {
+        Self::ensure_not_paused(&env)?;
         let admin = storage::get_admin(&env);
         admin.require_auth();
 
         if total_amount <= 0 {
-            panic!("total_amount must be positive");
+            return Err(ContractError::NegativeAmount); // total_amount must be positive
         }
         if duration_seconds == 0 {
-            panic!("duration_seconds must be positive");
+            return Err(ContractError::NegativeAmount); // duration_seconds must be positive
         }
         let remaining_supply = storage::get_max_supply(&env)
             .checked_sub(storage::get_total_supply(&env))
-            .expect("current supply exceeds maximum supply");
+            .ok_or(ContractError::MaxSupplyExceeded)?; // current supply exceeds maximum supply
         if total_amount > remaining_supply {
-            panic!("vesting amount exceeds remaining supply capacity");
+            return Err(ContractError::MaxSupplyExceeded); // vesting amount exceeds remaining supply capacity
         }
         if storage::get_vesting_schedule(&env, &beneficiary).is_some() {
-            panic!("vesting schedule already exists for beneficiary");
+            return Err(ContractError::AlreadyInitialized); // vesting schedule already exists
         }
 
         let schedule = storage::VestingSchedule {
@@ -1681,6 +1801,7 @@ impl LearnToken {
             cliff_timestamp,
             duration_seconds,
         );
+        Ok(())
     }
 
     /// Claim vested tokens. Beneficiary only.
@@ -1689,20 +1810,20 @@ impl LearnToken {
     ///
     /// # Arguments
     /// * `beneficiary` - Address claiming their vested tokens (must authorize)
-    pub fn claim_vested(env: Env, beneficiary: Address) {
-        Self::require_not_paused(&env);
+    pub fn claim_vested(env: Env, beneficiary: Address) -> Result<(), ContractError> {
+        Self::ensure_not_paused(&env)?;
         beneficiary.require_auth();
 
-        let schedule =
-            storage::get_vesting_schedule(&env, &beneficiary).expect("no vesting schedule found");
+        let schedule = storage::get_vesting_schedule(&env, &beneficiary)
+            .ok_or(ContractError::NotAuthorized)?; // no vesting schedule found
 
         if schedule.exhausted {
-            panic!("vesting schedule fully claimed");
+            return Err(ContractError::AlreadyInitialized); // vesting schedule fully claimed
         }
 
         let now = env.ledger().timestamp();
         if now < schedule.cliff_timestamp {
-            panic!("cliff not reached");
+            return Err(ContractError::ExpirationInPast); // cliff not reached
         }
 
         let elapsed = now.saturating_sub(schedule.cliff_timestamp);
@@ -1717,7 +1838,7 @@ impl LearnToken {
         let claimable = vested_amount - already_claimed;
 
         if claimable <= 0 {
-            panic!("no tokens available to claim");
+            return Err(ContractError::NegativeAmount); // no tokens available to claim
         }
 
         // Check max_supply before minting
@@ -1727,7 +1848,7 @@ impl LearnToken {
             .checked_add(claimable)
             .map_or(true, |s| s > max_supply)
         {
-            panic!("maximum supply cap exceeded");
+            return Err(ContractError::MaxSupplyExceeded);
         }
 
         let new_claimed = already_claimed + claimable;
@@ -1747,6 +1868,7 @@ impl LearnToken {
         storage::add_total_minted_to(&env, &beneficiary, claimable);
 
         events::vesting_claimed(&env, &beneficiary, claimable, new_claimed);
+        Ok(())
     }
 
     /// Return the vesting schedule for a beneficiary (#225).
@@ -1786,19 +1908,19 @@ impl LearnToken {
         start_time: u64,
         end_time: u64,
         snapshot_ledger: u32,
-    ) -> u64 {
-        Self::require_not_paused(&env);
+    ) -> Result<u64, ContractError> {
+        Self::ensure_not_paused(&env)?;
         let admin = storage::get_admin(&env);
         admin.require_auth();
 
         if choices < 2 {
-            panic!("proposal must have at least 2 choices");
+            return Err(ContractError::NegativeAmount); // too few choices
         }
         if end_time <= start_time {
-            panic!("end_time must be after start_time");
+            return Err(ContractError::ExpirationInPast); // end_time must be after start_time
         }
         if snapshot_ledger >= env.ledger().sequence() {
-            panic!("snapshot_ledger must be earlier than the current ledger");
+            return Err(ContractError::ExpirationInPast); // snapshot_ledger must be earlier than current
         }
 
         let mut vote_totals = Vec::new(&env);
@@ -1819,7 +1941,7 @@ impl LearnToken {
         };
         storage::set_proposal(&env, proposal_id, &proposal);
         events::proposal_created(&env, proposal_id, start_time, end_time);
-        proposal_id
+        Ok(proposal_id)
     }
 
     /// Cast a vote on a governance proposal.
@@ -1831,31 +1953,37 @@ impl LearnToken {
     /// * `voter` - The voting address (must authorize)
     /// * `proposal_id` - The proposal to vote on
     /// * `choice` - Zero-based choice index (0 = first choice, etc.)
-    pub fn vote(env: Env, voter: Address, proposal_id: u64, choice: u32) {
-        Self::require_not_paused(&env);
+    pub fn vote(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+        choice: u32,
+    ) -> Result<(), ContractError> {
+        Self::ensure_not_paused(&env)?;
         voter.require_auth();
 
-        let mut proposal = storage::get_proposal(&env, proposal_id).expect("proposal not found");
+        let mut proposal =
+            storage::get_proposal(&env, proposal_id).ok_or(ContractError::NotAuthorized)?; // proposal not found
 
         let now = env.ledger().timestamp();
         if now < proposal.start_time {
-            panic!("voting has not started");
+            return Err(ContractError::ExpirationInPast); // voting has not started
         }
         if now >= proposal.end_time {
-            panic!("voting has ended");
+            return Err(ContractError::ExpirationInPast); // voting has ended
         }
         if choice >= proposal.choices {
-            panic!("invalid choice");
+            return Err(ContractError::NotAuthorized); // invalid choice
         }
         if storage::has_voted(&env, proposal_id, &voter) {
-            panic!("already voted");
+            return Err(ContractError::AlreadyInitialized); // already voted
         }
 
         let voting_power = storage::get_snapshot_balance(&env, &voter, proposal.snapshot_ledger)
-            .expect("no snapshot available at specified ledger");
+            .ok_or(ContractError::NotAuthorized)?; // no snapshot available at specified ledger
 
         if voting_power == 0 {
-            panic!("no voting power");
+            return Err(ContractError::NotAuthorized); // no voting power
         }
 
         let current = proposal.vote_totals.get(choice).unwrap_or(0);
@@ -1864,6 +1992,7 @@ impl LearnToken {
         storage::set_vote(&env, proposal_id, &voter, choice);
 
         events::vote_cast(&env, proposal_id, &voter, choice, voting_power);
+        Ok(())
     }
 
     /// Execute a proposal after its voting period ends.
@@ -1876,20 +2005,21 @@ impl LearnToken {
     ///
     /// # Returns
     /// The winning choice index.
-    pub fn execute_proposal(env: Env, proposal_id: u64) -> u32 {
-        Self::require_not_paused(&env);
+    pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<u32, ContractError> {
+        Self::ensure_not_paused(&env)?;
         let admin = storage::get_admin(&env);
         admin.require_auth();
 
-        let mut proposal = storage::get_proposal(&env, proposal_id).expect("proposal not found");
+        let mut proposal =
+            storage::get_proposal(&env, proposal_id).ok_or(ContractError::NotAuthorized)?; // proposal not found
 
         if proposal.executed {
-            panic!("proposal already executed");
+            return Err(ContractError::AlreadyInitialized); // already executed
         }
 
         let now = env.ledger().timestamp();
         if now < proposal.end_time {
-            panic!("voting period has not ended");
+            return Err(ContractError::ExpirationInPast); // voting period has not ended
         }
 
         // Tally: find the choice with the most votes.
@@ -1903,12 +2033,16 @@ impl LearnToken {
             }
         }
 
+        if winning_votes == 0 {
+            return Err(ContractError::NotAuthorized);
+        }
+
         proposal.executed = true;
         proposal.winning_choice = winning_choice;
         storage::set_proposal(&env, proposal_id, &proposal);
 
         events::proposal_executed(&env, proposal_id, winning_choice, winning_votes);
-        winning_choice
+        Ok(winning_choice)
     }
 
     /// Retrieve a governance proposal by ID (#226).
@@ -1924,6 +2058,7 @@ impl LearnToken {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use soroban_sdk::{
         testutils::{storage::Persistent as _, Address as _, Events as _, Ledger as _},
@@ -2260,6 +2395,117 @@ mod tests {
         assert_eq!(client.total_minted_to(&learner), client.balance(&learner));
     }
 
+    /// Collects the `reward` events emitted by the learn-token contract as
+    /// `(learner, course_id, quiz_id, score, amount)` tuples, in emission order.
+    fn reward_events(
+        env: &Env,
+        lt_id: &Address,
+    ) -> std::vec::Vec<(Address, Symbol, Symbol, u32, i128)> {
+        let reward_topic = Symbol::new(env, "reward");
+        let mut out = std::vec::Vec::new();
+        for (contract, topics, data) in env.events().all().iter() {
+            if &contract != lt_id {
+                continue;
+            }
+            let topics: Vec<soroban_sdk::Val> = topics;
+            if topics.len() != 3 {
+                continue;
+            }
+            let first: Symbol =
+                soroban_sdk::TryFromVal::try_from_val(env, &topics.get(0).unwrap()).unwrap();
+            if first != reward_topic {
+                continue;
+            }
+            let learner: Address =
+                soroban_sdk::TryFromVal::try_from_val(env, &topics.get(1).unwrap()).unwrap();
+            let course: Symbol =
+                soroban_sdk::TryFromVal::try_from_val(env, &topics.get(2).unwrap()).unwrap();
+            let (quiz, score, amount): (Symbol, u32, i128) =
+                soroban_sdk::TryFromVal::try_from_val(env, &data).unwrap();
+            out.push((learner, course, quiz, score, amount));
+        }
+        out
+    }
+
+    #[test]
+    fn test_batch_claim_reward_emits_event_per_claimed_quiz() {
+        let env = Env::default();
+        let (_admin, lt_id, pt_id) = setup(&env);
+        let client = LearnTokenClient::new(&env, &lt_id);
+        let pt_client = progress_tracker::ProgressTrackerClient::new(&env, &pt_id);
+
+        env.mock_all_auths();
+        let learner = Address::generate(&env);
+        let course_id = Symbol::new(&env, "rust_101");
+        let quiz_ids = [
+            Symbol::new(&env, "quiz_1"),
+            Symbol::new(&env, "quiz_2"),
+            Symbol::new(&env, "quiz_3"),
+        ];
+        let scores = [70u32, 80, 90];
+        create_course_with_quiz_scores(&env, &pt_client, &learner, &course_id, &quiz_ids, &scores);
+
+        let mut batch = Vec::new(&env);
+        for quiz_id in &quiz_ids {
+            batch.push_back(quiz_id.clone());
+        }
+        let claimed = client.batch_claim_reward(&learner, &course_id, &batch);
+        assert_eq!(claimed.len(), 3);
+
+        let events = reward_events(&env, &lt_id);
+        assert_eq!(events.len(), 3);
+        for (i, (ev_learner, ev_course, ev_quiz, ev_score, ev_amount)) in events.iter().enumerate()
+        {
+            assert_eq!(ev_learner, &learner);
+            assert_eq!(ev_course, &course_id);
+            assert_eq!(ev_quiz, &quiz_ids[i]);
+            assert_eq!(*ev_score, scores[i]);
+            assert_eq!(*ev_amount, (scores[i] as i128) * BASE_REWARD_PER_POINT);
+        }
+    }
+
+    #[test]
+    fn test_batch_claim_reward_partial_batch_emits_only_successful_events() {
+        let env = Env::default();
+        let (_admin, lt_id, pt_id) = setup(&env);
+        let client = LearnTokenClient::new(&env, &lt_id);
+        let pt_client = progress_tracker::ProgressTrackerClient::new(&env, &pt_id);
+
+        env.mock_all_auths();
+        let learner = Address::generate(&env);
+        let course_id = Symbol::new(&env, "rust_101");
+        let quiz_ids = [
+            Symbol::new(&env, "quiz_1"),
+            Symbol::new(&env, "quiz_2"),
+            Symbol::new(&env, "quiz_3"),
+        ];
+        let scores = [70u32, 80, 90];
+        create_course_with_quiz_scores(&env, &pt_client, &learner, &course_id, &quiz_ids, &scores);
+
+        // quiz_2 is claimed up front, so the batch must skip it silently.
+        client.claim_reward(&learner, &course_id, &quiz_ids[1]);
+        let events_before = reward_events(&env, &lt_id).len();
+        assert_eq!(events_before, 1);
+
+        let mut batch = Vec::new(&env);
+        for quiz_id in &quiz_ids {
+            batch.push_back(quiz_id.clone());
+        }
+        let claimed = client.batch_claim_reward(&learner, &course_id, &batch);
+        assert_eq!(claimed.len(), 2);
+
+        // Only the two newly claimed quizzes add events; quiz_2 adds none.
+        let events = reward_events(&env, &lt_id);
+        assert_eq!(events.len(), events_before + 2);
+        for (event, idx) in events[events_before..].iter().zip([0usize, 2]) {
+            assert_eq!(event.0, learner);
+            assert_eq!(event.1, course_id);
+            assert_eq!(event.2, quiz_ids[idx]);
+            assert_eq!(event.3, scores[idx]);
+            assert_eq!(event.4, (scores[idx] as i128) * BASE_REWARD_PER_POINT);
+        }
+    }
+
     // ── Issue #237: reward claim history ─────────────────────────────────
 
     #[test]
@@ -2464,7 +2710,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "already paused")]
     fn test_pause_twice_panics() {
         let env = Env::default();
         let (admin, lt_id, _pt_id) = setup(&env);
@@ -2472,18 +2717,27 @@ mod tests {
 
         env.mock_all_auths();
         client.pause(&admin);
-        client.pause(&admin);
+        let err = client
+            .try_pause(&admin)
+            .err()
+            .expect("should fail")
+            .expect("expected typed error");
+        assert_eq!(err, ContractError::AlreadyInitialized);
     }
 
     #[test]
-    #[should_panic(expected = "not paused")]
     fn test_unpause_when_not_paused_panics() {
         let env = Env::default();
         let (admin, lt_id, _pt_id) = setup(&env);
         let client = LearnTokenClient::new(&env, &lt_id);
 
         env.mock_all_auths();
-        client.unpause(&admin);
+        let err = client
+            .try_unpause(&admin)
+            .err()
+            .expect("should fail")
+            .expect("expected typed error");
+        assert_eq!(err, ContractError::AlreadyInitialized);
     }
 
     #[test]
@@ -2815,7 +3069,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "decrease exceeds allowance")]
     fn test_decrease_allowance_below_zero_panics() {
         let env = Env::default();
         let (_, lt_contract_id, _) = setup(&env);
@@ -2826,7 +3079,12 @@ mod tests {
         env.mock_all_auths();
 
         client.approve(&owner, &spender, &50, &999999);
-        client.decrease_allowance(&owner, &spender, &100); // exceeds 50
+        let err = client
+            .try_decrease_allowance(&owner, &spender, &100)
+            .err()
+            .expect("should fail")
+            .expect("expected typed error");
+        assert_eq!(err, ContractError::InsufficientAllowance);
     }
 
     #[test]
@@ -3402,7 +3660,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "invalid nonce")]
     fn test_permit_rejects_invalid_nonce() {
         let env = Env::default();
         let (_, lt_contract_id, _) = setup(&env);
@@ -3413,7 +3670,12 @@ mod tests {
         env.mock_all_auths();
 
         let exp = env.ledger().sequence() + 100;
-        client.permit(&owner, &spender, &500, &exp, &1);
+        let err = client
+            .try_permit(&owner, &spender, &500, &exp, &1)
+            .err()
+            .expect("should fail")
+            .expect("expected typed error");
+        assert_eq!(err, ContractError::NotAuthorized);
     }
 
     // ── Vesting tests (#225) ─────────────────────────────────────────────────
@@ -4423,7 +4685,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "decrease exceeds allowance")]
     fn test_decrease_allowance_underflow_panics() {
         let env = Env::default();
         let (_admin, lt_contract_id, _) = setup(&env);
@@ -4435,7 +4696,12 @@ mod tests {
 
         let exp = env.ledger().sequence() + 1000;
         client.approve(&owner, &spender, &50, &exp);
-        client.decrease_allowance(&owner, &spender, &51);
+        let err = client
+            .try_decrease_allowance(&owner, &spender, &51)
+            .err()
+            .expect("should fail")
+            .expect("expected typed error");
+        assert_eq!(err, ContractError::InsufficientAllowance);
     }
 
     #[test]
@@ -4468,7 +4734,9 @@ mod tests {
         client.increase_allowance(&owner, &spender, &150, &exp);
 
         let all_events = env.events().all();
-        let last_event = all_events.last().expect("expected approve event from increase");
+        let last_event = all_events
+            .last()
+            .expect("expected approve event from increase");
         assert_eq!(
             soroban_sdk::vec![&env, last_event],
             soroban_sdk::vec![
@@ -4484,7 +4752,9 @@ mod tests {
         client.decrease_allowance(&owner, &spender, &50);
 
         let all_events = env.events().all();
-        let last_event = all_events.last().expect("expected approve event from decrease");
+        let last_event = all_events
+            .last()
+            .expect("expected approve event from decrease");
         assert_eq!(
             soroban_sdk::vec![&env, last_event],
             soroban_sdk::vec![
@@ -4501,7 +4771,6 @@ mod tests {
     // ── Issue #530: governance edge-case tests ───────────────────────────
 
     #[test]
-    #[should_panic(expected = "already voted")]
     fn test_governance_rejects_voting_twice_on_same_proposal() {
         let env = Env::default();
         let (admin, contract_id, _) = setup(&env);
@@ -4527,11 +4796,15 @@ mod tests {
         );
 
         client.vote(&voter, &proposal_id, &0);
-        client.vote(&voter, &proposal_id, &1);
+        let err = client
+            .try_vote(&voter, &proposal_id, &1)
+            .err()
+            .expect("should fail")
+            .expect("expected typed error");
+        assert_eq!(err, ContractError::AlreadyInitialized);
     }
 
     #[test]
-    #[should_panic(expected = "no snapshot available at specified ledger")]
     fn test_governance_rejects_voter_without_recorded_snapshot_balance() {
         let env = Env::default();
         let (_admin, contract_id, _) = setup(&env);
@@ -4557,11 +4830,15 @@ mod tests {
             &snapshot_ledger,
         );
 
-        client.vote(&voter, &proposal_id, &0);
+        let err = client
+            .try_vote(&voter, &proposal_id, &0)
+            .err()
+            .expect("should fail")
+            .expect("expected typed error");
+        assert_eq!(err, ContractError::NotAuthorized);
     }
 
     #[test]
-    #[should_panic(expected = "voting has ended")]
     fn test_governance_rejects_vote_after_end_time() {
         let env = Env::default();
         let (admin, contract_id, _) = setup(&env);
@@ -4586,27 +4863,41 @@ mod tests {
             &snapshot_ledger,
         );
 
-        client.vote(&voter, &proposal_id, &0);
+        let err = client
+            .try_vote(&voter, &proposal_id, &0)
+            .err()
+            .expect("should fail")
+            .expect("expected typed error");
+        assert_eq!(err, ContractError::ExpirationInPast);
     }
 
     #[test]
-    #[should_panic(expected = "voting period has not ended")]
     fn test_governance_rejects_execution_before_end_time() {
         let env = Env::default();
         let (admin, contract_id, _) = setup(&env);
         let client = LearnTokenClient::new(&env, &contract_id);
 
         env.mock_all_auths();
-        env.ledger().with_mut(|li| li.timestamp = 1_500);
-        client.create_proposal(
+        env.ledger().with_mut(|li| {
+            li.timestamp = 1_500;
+            li.sequence_number = 99;
+        });
+        let snapshot_ledger = env.ledger().sequence();
+        env.ledger().with_mut(|li| li.sequence_number = 100);
+        let proposal_id = client.create_proposal(
             &SorobanString::from_str(&env, "Early execution"),
             &2,
             &1_000,
             &2_000,
-            &env.ledger().sequence(),
+            &snapshot_ledger,
         );
 
-        client.execute_proposal(&1);
+        let err = client
+            .try_execute_proposal(&proposal_id)
+            .err()
+            .expect("should fail")
+            .expect("expected typed error");
+        assert_eq!(err, ContractError::ExpirationInPast);
     }
 
     #[test]

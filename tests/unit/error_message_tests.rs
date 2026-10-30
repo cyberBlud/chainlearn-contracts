@@ -6,8 +6,10 @@
 //! 3. Correctly identify the error type
 //! 4. Cover all error paths across all contracts
 
-use credential_nft::{CredentialNft, CredentialNftClient};
-use learn_token::{LearnToken, LearnTokenClient};
+use credential_nft::{
+    ContractError as CredentialContractError, CredentialNft, CredentialNftClient,
+};
+use learn_token::{ContractError, LearnToken, LearnTokenClient};
 use progress_tracker::{ProgressTracker, ProgressTrackerClient};
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger as _},
@@ -80,7 +82,13 @@ mod error_message_tests {
             quiz_ids.push_back(Symbol::new(env, &format!("quiz_{}", i + 1)));
         }
 
-        client.create_course(course_id, &module_count, &quiz_count, &module_ids, &quiz_ids);
+        client.create_course(
+            course_id,
+            &module_count,
+            &quiz_count,
+            &module_ids,
+            &quiz_ids,
+        );
     }
 
     fn create_course_and_submit_quiz(
@@ -106,10 +114,9 @@ mod error_message_tests {
     // ── Credential NFT Error Message Tests ────────────────────────────────
 
     #[test]
-    #[should_panic(expected = "metadata_uri cannot be empty")]
     fn test_credential_nft_empty_metadata_uri_error_message() {
         let env = Env::default();
-        let (_admin, contract_id, tracker_id) = setup_credential_nft(&env);
+        let (admin, contract_id, tracker_id) = setup_credential_nft(&env);
         let client = CredentialNftClient::new(&env, &contract_id);
 
         let learner = Address::generate(&env);
@@ -117,17 +124,28 @@ mod error_message_tests {
 
         let course_id = Symbol::new(&env, "rust_101");
         let pt_client = ProgressTrackerClient::new(&env, &tracker_id);
-        create_course_and_submit_quiz(&env, &pt_client, &learner, &course_id, &Symbol::new(&env, "quiz_1"), 85);
+        create_course_and_submit_quiz(
+            &env,
+            &pt_client,
+            &learner,
+            &course_id,
+            &Symbol::new(&env, "quiz_1"),
+            85,
+        );
 
         let empty_uri = Symbol::new(&env, "");
-        client.mint_credential(&learner, &course_id, &85, &empty_uri);
+        let err = client
+            .try_mint_credential(&admin, &learner, &course_id, &85, &empty_uri)
+            .err()
+            .expect("should fail")
+            .expect("typed error");
+        assert_eq!(err, CredentialContractError::InvalidMetadataUri);
     }
 
     #[test]
-    #[should_panic(expected = "metadata_uri too short: minimum length is 8")]
     fn test_credential_nft_short_metadata_uri_error_message() {
         let env = Env::default();
-        let (_admin, contract_id, tracker_id) = setup_credential_nft(&env);
+        let (admin, contract_id, tracker_id) = setup_credential_nft(&env);
         let client = CredentialNftClient::new(&env, &contract_id);
 
         let learner = Address::generate(&env);
@@ -135,17 +153,28 @@ mod error_message_tests {
 
         let course_id = Symbol::new(&env, "rust_101");
         let pt_client = ProgressTrackerClient::new(&env, &tracker_id);
-        create_course_and_submit_quiz(&env, &pt_client, &learner, &course_id, &Symbol::new(&env, "quiz_1"), 85);
+        create_course_and_submit_quiz(
+            &env,
+            &pt_client,
+            &learner,
+            &course_id,
+            &Symbol::new(&env, "quiz_1"),
+            85,
+        );
 
         let short_uri = Symbol::new(&env, "ipfs_1");
-        client.mint_credential(&learner, &course_id, &85, &short_uri);
+        let err = client
+            .try_mint_credential(&admin, &learner, &course_id, &85, &short_uri)
+            .err()
+            .expect("should fail")
+            .expect("typed error");
+        assert_eq!(err, CredentialContractError::InvalidMetadataUri);
     }
 
     #[test]
-    #[should_panic(expected = "metadata_uri is malformed: must start with a valid URI scheme")]
     fn test_credential_nft_malformed_metadata_uri_error_message() {
         let env = Env::default();
-        let (_admin, contract_id, tracker_id) = setup_credential_nft(&env);
+        let (admin, contract_id, tracker_id) = setup_credential_nft(&env);
         let client = CredentialNftClient::new(&env, &contract_id);
 
         let learner = Address::generate(&env);
@@ -153,17 +182,28 @@ mod error_message_tests {
 
         let course_id = Symbol::new(&env, "rust_101");
         let pt_client = ProgressTrackerClient::new(&env, &tracker_id);
-        create_course_and_submit_quiz(&env, &pt_client, &learner, &course_id, &Symbol::new(&env, "quiz_1"), 85);
+        create_course_and_submit_quiz(
+            &env,
+            &pt_client,
+            &learner,
+            &course_id,
+            &Symbol::new(&env, "quiz_1"),
+            85,
+        );
 
         let malformed_uri = Symbol::new(&env, "ftp_metadata_hash");
-        client.mint_credential(&learner, &course_id, &85, &malformed_uri);
+        let err = client
+            .try_mint_credential(&admin, &learner, &course_id, &85, &malformed_uri)
+            .err()
+            .expect("should fail")
+            .expect("typed error");
+        assert_eq!(err, CredentialContractError::InvalidMetadataUri);
     }
 
     #[test]
-    #[should_panic(expected = "score 40 below minimum threshold 50")]
     fn test_credential_nft_low_score_error_message() {
         let env = Env::default();
-        let (_admin, contract_id, tracker_id) = setup_credential_nft(&env);
+        let (admin, contract_id, tracker_id) = setup_credential_nft(&env);
         let client = CredentialNftClient::new(&env, &contract_id);
 
         let learner = Address::generate(&env);
@@ -171,18 +211,29 @@ mod error_message_tests {
 
         let course_id = Symbol::new(&env, "rust_101");
         let metadata_uri = Symbol::new(&env, "ipfs_Qm123");
-        
-        let pt_client = ProgressTrackerClient::new(&env, &tracker_id);
-        create_course_and_submit_quiz(&env, &pt_client, &learner, &course_id, &Symbol::new(&env, "quiz_1"), 85);
 
-        client.mint_credential(&learner, &course_id, &40, &metadata_uri);
+        let pt_client = ProgressTrackerClient::new(&env, &tracker_id);
+        create_course_and_submit_quiz(
+            &env,
+            &pt_client,
+            &learner,
+            &course_id,
+            &Symbol::new(&env, "quiz_1"),
+            85,
+        );
+
+        let err = client
+            .try_mint_credential(&admin, &learner, &course_id, &40, &metadata_uri)
+            .err()
+            .expect("should fail")
+            .expect("typed error");
+        assert_eq!(err, CredentialContractError::InvalidScore);
     }
 
     #[test]
-    #[should_panic(expected = "credential already exists for this learner and course")]
     fn test_credential_nft_duplicate_credential_error_message() {
         let env = Env::default();
-        let (_admin, contract_id, tracker_id) = setup_credential_nft(&env);
+        let (admin, contract_id, tracker_id) = setup_credential_nft(&env);
         let client = CredentialNftClient::new(&env, &contract_id);
 
         let learner = Address::generate(&env);
@@ -190,54 +241,74 @@ mod error_message_tests {
 
         let course_id = Symbol::new(&env, "rust_101");
         let uri = Symbol::new(&env, "ipfs_Qm123");
-        
-        let pt_client = ProgressTrackerClient::new(&env, &tracker_id);
-        create_course_and_submit_quiz(&env, &pt_client, &learner, &course_id, &Symbol::new(&env, "quiz_1"), 85);
 
-        client.mint_credential(&learner, &course_id, &85, &uri);
-        client.mint_credential(&learner, &course_id, &85, &uri);
+        let pt_client = ProgressTrackerClient::new(&env, &tracker_id);
+        create_course_and_submit_quiz(
+            &env,
+            &pt_client,
+            &learner,
+            &course_id,
+            &Symbol::new(&env, "quiz_1"),
+            85,
+        );
+
+        client.mint_credential(&admin, &learner, &course_id, &85, &uri);
+        let err = client
+            .try_mint_credential(&admin, &learner, &course_id, &85, &uri)
+            .err()
+            .expect("should fail")
+            .expect("typed error");
+        assert_eq!(err, CredentialContractError::DuplicateCredential);
     }
 
     #[test]
-    #[should_panic(expected = "course does not exist")]
     fn test_credential_nft_nonexistent_course_error_message() {
         let env = Env::default();
-        let (_admin, contract_id, _tracker_id) = setup_credential_nft(&env);
+        let (admin, contract_id, _tracker_id) = setup_credential_nft(&env);
         let client = CredentialNftClient::new(&env, &contract_id);
-
         let learner = Address::generate(&env);
         env.mock_all_auths();
-
         let course_id = Symbol::new(&env, "nonexistent_course");
         let metadata_uri = Symbol::new(&env, "ipfs_Qm123");
-
-        client.mint_credential(&learner, &course_id, &85, &metadata_uri);
+        let err = client
+            .try_mint_credential(&admin, &learner, &course_id, &85, &metadata_uri)
+            .err()
+            .expect("should fail")
+            .expect("typed error");
+        assert_eq!(err, CredentialContractError::NotFound);
     }
 
     #[test]
-    #[should_panic(expected = "score 100 does not match verified score 85")]
     fn test_credential_nft_mismatched_score_error_message() {
         let env = Env::default();
-        let (_admin, contract_id, tracker_id) = setup_credential_nft(&env);
+        let (admin, contract_id, tracker_id) = setup_credential_nft(&env);
         let client = CredentialNftClient::new(&env, &contract_id);
-
         let learner = Address::generate(&env);
         env.mock_all_auths();
-
         let course_id = Symbol::new(&env, "rust_101");
         let uri = Symbol::new(&env, "ipfs_meta");
-        
         let pt_client = ProgressTrackerClient::new(&env, &tracker_id);
-        create_course_and_submit_quiz(&env, &pt_client, &learner, &course_id, &Symbol::new(&env, "quiz_1"), 85);
-
-        client.mint_credential(&learner, &course_id, &100, &uri);
+        create_course_and_submit_quiz(
+            &env,
+            &pt_client,
+            &learner,
+            &course_id,
+            &Symbol::new(&env, "quiz_1"),
+            85,
+        );
+        let err = client
+            .try_mint_credential(&admin, &learner, &course_id, &100, &uri)
+            .err()
+            .expect("should fail")
+            .expect("typed error");
+        assert_eq!(err, CredentialContractError::InvalidScore);
     }
 
     #[test]
     #[should_panic(expected = "limit must be greater than zero")]
     fn test_credential_nft_zero_limit_error_message() {
         let env = Env::default();
-        let (_admin, contract_id, _tracker_id) = setup_credential_nft(&env);
+        let (admin, contract_id, _tracker_id) = setup_credential_nft(&env);
         let client = CredentialNftClient::new(&env, &contract_id);
 
         let learner = Address::generate(&env);
@@ -245,39 +316,49 @@ mod error_message_tests {
     }
 
     #[test]
-    #[should_panic(expected = "credential already revoked")]
     fn test_credential_nft_double_revoke_error_message() {
         let env = Env::default();
-        let (_admin, contract_id, tracker_id) = setup_credential_nft(&env);
+        let (admin, contract_id, tracker_id) = setup_credential_nft(&env);
         let client = CredentialNftClient::new(&env, &contract_id);
-
         let learner = Address::generate(&env);
         env.mock_all_auths();
-
         let course_id = Symbol::new(&env, "rust_101");
         let uri = Symbol::new(&env, "ipfs_meta");
-        
         let pt_client = ProgressTrackerClient::new(&env, &tracker_id);
-        create_course_and_submit_quiz(&env, &pt_client, &learner, &course_id, &Symbol::new(&env, "quiz_1"), 85);
-
-        let cred_id = client.mint_credential(&learner, &course_id, &85, &uri);
+        create_course_and_submit_quiz(
+            &env,
+            &pt_client,
+            &learner,
+            &course_id,
+            &Symbol::new(&env, "quiz_1"),
+            85,
+        );
+        let cred_id = client.mint_credential(&admin, &learner, &course_id, &85, &uri);
         client.revoke_credential(&cred_id);
-        client.revoke_credential(&cred_id);
+        let err = client
+            .try_revoke_credential(&cred_id)
+            .err()
+            .expect("should fail")
+            .expect("typed error");
+        assert_eq!(err, CredentialContractError::AlreadyInitialized);
     }
 
     #[test]
-    #[should_panic(expected = "cannot transfer admin to zero address")]
     fn test_credential_nft_transfer_to_zero_address_error_message() {
         let env = Env::default();
-        let (_admin, contract_id, _tracker_id) = setup_credential_nft(&env);
+        let (admin, contract_id, _tracker_id) = setup_credential_nft(&env);
         let client = CredentialNftClient::new(&env, &contract_id);
-
         env.mock_all_auths();
         let zero_address = Address::from_string(&SorobanString::from_str(
             &env,
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
         ));
-        client.transfer_admin(&zero_address);
+        let err = client
+            .try_transfer_admin(&zero_address)
+            .err()
+            .expect("should fail")
+            .expect("typed error");
+        assert_eq!(err, CredentialContractError::NotAuthorized);
     }
 
     // ── Learn Token Error Message Tests ───────────────────────────────────
@@ -360,30 +441,28 @@ mod error_message_tests {
     }
 
     #[test]
-    #[should_panic(expected = "score must be greater than 0")]
     fn test_learn_token_zero_score_error_message() {
         let env = Env::default();
         let (_admin, contract_id, pt_contract_id) = setup_token(&env);
         let client = LearnTokenClient::new(&env, &contract_id);
         let pt_client = ProgressTrackerClient::new(&env, &pt_contract_id);
-
         let learner = Address::generate(&env);
         env.mock_all_auths();
-
         let course_id = Symbol::new(&env, "course_1");
         let quiz_id = Symbol::new(&env, "quiz_1");
-        
         let mut module_ids = Vec::new(&env);
         module_ids.push_back(Symbol::new(&env, "mod_1"));
         let mut quiz_ids = Vec::new(&env);
         quiz_ids.push_back(quiz_id.clone());
         pt_client.create_course(&course_id, &1, &1, &module_ids, &quiz_ids);
         pt_client.enroll(&learner, &course_id);
-        
-        // progress-tracker accepts zero scores; learn-token rejects them when
-        // calculating a reward from the cross-contract score lookup.
         pt_client.submit_quiz_score(&learner, &course_id, &quiz_id, &0);
-        client.claim_reward(&learner, &course_id, &quiz_id);
+        let err = client
+            .try_claim_reward(&learner, &course_id, &quiz_id)
+            .err()
+            .expect("should fail")
+            .expect("expected typed error");
+        assert_eq!(err, ContractError::InvalidScore);
     }
 
     #[test]
@@ -417,29 +496,30 @@ mod error_message_tests {
     }
 
     #[test]
-    #[should_panic(expected = "cannot mint to zero address")]
     fn test_learn_token_mint_to_zero_address_error_message() {
         let env = Env::default();
         let (admin, contract_id, _) = setup_token(&env);
         let client = LearnTokenClient::new(&env, &contract_id);
         env.mock_all_auths();
-
         let zero_address = Address::from_string(&SorobanString::from_str(
             &env,
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
         ));
-        client.mint(&admin, &zero_address, &1000);
+        let err = client
+            .try_mint(&admin, &zero_address, &1000)
+            .err()
+            .expect("should fail")
+            .expect("expected typed error");
+        assert_eq!(err, ContractError::ZeroAddress);
     }
 
     #[test]
-    #[should_panic(expected = "maximum supply cap exceeded")]
     fn test_learn_token_max_supply_exceeded_error_message() {
         let env = Env::default();
         let admin = Address::generate(&env);
         let pt_contract_id = env.register_contract(None, ProgressTracker);
         let pt_client = ProgressTrackerClient::new(&env, &pt_contract_id);
         pt_client.initialize(&admin);
-
         let contract_id = env.register_contract(None, LearnToken);
         let client = LearnTokenClient::new(&env, &contract_id);
         client.initialize(
@@ -450,12 +530,15 @@ mod error_message_tests {
             &pt_contract_id,
             &5000,
         );
-
         let user = Address::generate(&env);
         env.mock_all_auths();
-
         client.mint(&admin, &user, &3000);
-        client.mint(&admin, &user, &2001);
+        let err = client
+            .try_mint(&admin, &user, &2001)
+            .err()
+            .expect("should fail")
+            .expect("expected typed error");
+        assert_eq!(err, ContractError::MaxSupplyExceeded);
     }
 
     #[test]
@@ -518,7 +601,7 @@ mod error_message_tests {
         env.mock_all_auths();
         let course_id = Symbol::new(&env, "rust_101");
         create_course_with_modules_and_quizzes(&env, &client, &course_id, 3, 2);
-        
+
         // Try to create same course again
         create_course_with_modules_and_quizzes(&env, &client, &course_id, 3, 2);
     }
@@ -664,7 +747,7 @@ mod error_message_tests {
 
         client.enroll(&learner, &course_id);
         client.submit_quiz_score(&learner, &course_id, &Symbol::new(&env, "quiz_1"), &80);
-        
+
         // Try to retake with lower score
         client.retake_quiz(&learner, &course_id, &Symbol::new(&env, "quiz_1"), &70);
     }
@@ -677,22 +760,22 @@ mod error_message_tests {
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
-        
+
         // Create prerequisite course
         let prereq_course_id = Symbol::new(&env, "prereq_101");
         create_course_with_modules_and_quizzes(&env, &client, &prereq_course_id, 2, 1);
-        
+
         // Create main course with prerequisite
         let main_course_id = Symbol::new(&env, "main_201");
         create_course_with_modules_and_quizzes(&env, &client, &main_course_id, 2, 1);
-        
+
         // Set prerequisite
         let mut prereqs = Vec::new(&env);
         prereqs.push_back(prereq_course_id.clone());
         client.set_prerequisites(&main_course_id, &prereqs);
-        
+
         let learner = Address::generate(&env);
-        
+
         // Try to enroll in main course without completing prerequisite
         client.enroll(&learner, &main_course_id);
     }
@@ -705,15 +788,52 @@ mod error_message_tests {
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
-        
+
         let course_id = Symbol::new(&env, "self_ref_course");
         create_course_with_modules_and_quizzes(&env, &client, &course_id, 2, 1);
-        
+
         let mut prereqs = Vec::new(&env);
         prereqs.push_back(course_id.clone());
         client.set_prerequisites(&course_id, &prereqs);
     }
 
-    // ── Error Message Analysis Tests ──────────────────────────────────────
+    #[test]
+    #[should_panic(expected = "caller is not the learner or their delegate")]
+    fn test_progress_tracker_non_delegate_caller_error_message() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup_progress_tracker(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
 
+        env.mock_all_auths();
+        let course_id = Symbol::new(&env, "rust_101");
+        create_course_with_modules_and_quizzes(&env, &client, &course_id, 3, 2);
+        let learner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        client.enroll(&learner, &course_id);
+        client.delegate_progress(&learner, &delegate);
+
+        client.complete_module_for(&stranger, &learner, &course_id, &Symbol::new(&env, "mod_1"));
+    }
+
+    #[test]
+    #[should_panic(expected = "caller is not the learner or their delegate")]
+    fn test_progress_tracker_revoked_delegate_error_message() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup_progress_tracker(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+
+        env.mock_all_auths();
+        let course_id = Symbol::new(&env, "rust_101");
+        create_course_with_modules_and_quizzes(&env, &client, &course_id, 3, 2);
+        let learner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        client.enroll(&learner, &course_id);
+        client.delegate_progress(&learner, &delegate);
+        client.revoke_delegation(&learner);
+
+        client.complete_module_for(&delegate, &learner, &course_id, &Symbol::new(&env, "mod_1"));
+    }
+
+    // ── Error Message Analysis Tests ──────────────────────────────────────
 }

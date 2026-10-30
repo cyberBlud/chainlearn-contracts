@@ -1,6 +1,6 @@
 //! Unit tests for the learn-token contract.
 
-use learn_token::{ClaimRecord, LearnToken, LearnTokenClient};
+use learn_token::{AdminInfo, AdminRole, ClaimRecord, ContractError, LearnToken, LearnTokenClient};
 use progress_tracker::{ProgressTracker, ProgressTrackerClient};
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger as _},
@@ -286,7 +286,6 @@ mod token_unit_tests {
     }
 
     #[test]
-    #[should_panic(expected = "maximum supply cap exceeded")]
     fn test_mint_beyond_max_supply_panics() {
         let env = Env::default();
         let admin = Address::generate(&env);
@@ -309,7 +308,9 @@ mod token_unit_tests {
         env.mock_all_auths();
 
         client.mint(&admin, &user, &3000);
-        client.mint(&admin, &user, &2001);
+        let err = client.try_mint(&admin, &user, &2001)
+            .err().expect("should fail").expect("expected typed error");
+        assert_eq!(err, ContractError::MaxSupplyExceeded);
     }
 
     #[test]
@@ -476,7 +477,6 @@ mod token_unit_tests {
     }
 
     #[test]
-    #[should_panic(expected = "cannot mint to zero address")]
     fn test_mint_to_zero_address_panics() {
         let env = Env::default();
         let (admin, contract_id, _) = setup_token(&env);
@@ -487,7 +487,9 @@ mod token_unit_tests {
             &env,
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
         ));
-        client.mint(&admin, &zero_address, &1000);
+        let err = client.try_mint(&admin, &zero_address, &1000)
+            .err().expect("should fail").expect("expected typed error");
+        assert_eq!(err, ContractError::ZeroAddress);
     }
 
     #[test]
@@ -676,7 +678,6 @@ mod token_unit_tests {
     }
 
     #[test]
-    #[should_panic(expected = "maximum supply cap exceeded")]
     fn test_security_mint_supply_overflow_reverts() {
         let env = Env::default();
         let (admin, contract_id, _pt_contract_id) = setup_token_with_max_supply(&env, i128::MAX);
@@ -685,17 +686,12 @@ mod token_unit_tests {
         let user = Address::generate(&env);
         env.mock_all_auths();
 
-        // Fill supply right up to the cap: current_supply becomes i128::MAX,
-        // which does not overflow (i128::MAX + 0 offset is representable).
         client.mint(&admin, &user, &i128::MAX);
         assert_eq!(client.total_supply(), i128::MAX);
 
-        // One more token would push `current_supply + amount` past
-        // i128::MAX. `mint` guards this with `checked_add` rather than a
-        // raw `+`, so the overflow itself never happens — it surfaces as
-        // the same clear, domain-specific panic as an ordinary cap breach
-        // instead of a raw arithmetic trap.
-        client.mint(&admin, &user, &1);
+        let err = client.try_mint(&admin, &user, &1)
+            .err().expect("should fail").expect("expected typed error");
+        assert_eq!(err, ContractError::MaxSupplyExceeded);
     }
 
     #[test]
@@ -891,7 +887,6 @@ mod token_unit_tests {
     }
 
     #[test]
-    #[should_panic(expected = "no snapshot available at specified ledger")]
     fn test_vote_rejects_missing_snapshot_instead_of_using_current_balance() {
         let env = Env::default();
         let (admin, contract_id, _) = setup_token(&env);
@@ -910,11 +905,12 @@ mod token_unit_tests {
         );
         env.ledger().with_mut(|l| l.timestamp = 500);
 
-        client.vote(&voter, &proposal_id, &0);
+        let err = client.try_vote(&voter, &proposal_id, &0)
+            .err().expect("should fail").expect("expected typed error");
+        assert_eq!(err, ContractError::NotAuthorized);
     }
 
     #[test]
-    #[should_panic(expected = "snapshot_ledger must be earlier than the current ledger")]
     fn test_create_proposal_rejects_current_or_future_snapshot_ledger() {
         let env = Env::default();
         let (_admin, contract_id, _) = setup_token(&env);
@@ -922,37 +918,78 @@ mod token_unit_tests {
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.sequence_number = 100);
 
-        client.create_proposal(
-            &SorobanString::from_str(&env, "Future snapshot"),
+        let current_err = client.try_create_proposal(
+            &SorobanString::from_str(&env, "Current snapshot"),
             &2,
             &0,
             &1_000,
             &100,
+        ).err().expect("should fail").expect("expected typed error");
+        assert_eq!(current_err, ContractError::ExpirationInPast);
+
+        let future_err = client.try_create_proposal(
+            &SorobanString::from_str(&env, "Future snapshot"),
+            &2,
+            &0,
+            &1_000,
+            &101,
+        ).err().expect("should fail").expect("expected typed error");
+        assert_eq!(future_err, ContractError::ExpirationInPast);
+        assert_eq!(client.proposal_count(), 0);
+    }
+
+    #[test]
+    fn test_execute_proposal_rejects_zero_votes() {
+        let env = Env::default();
+        let (_admin, contract_id, _) = setup_token(&env);
+        let client = LearnTokenClient::new(&env, &contract_id);
+        env.mock_all_auths();
+
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100;
+            l.timestamp = 0;
+        });
+        let proposal_id = client.create_proposal(
+            &SorobanString::from_str(&env, "No votes"),
+            &2,
+            &0,
+            &1_000,
+            &99,
         );
+
+        env.ledger().with_mut(|l| l.timestamp = 2_000);
+        let err = client.try_execute_proposal(&proposal_id)
+            .err().expect("should fail").expect("expected typed error");
+        assert_eq!(err, ContractError::NotAuthorized);
+
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+        assert!(!proposal.executed);
+        assert_eq!(proposal.winning_choice, u32::MAX);
+        assert_eq!(proposal.vote_totals.get(0).unwrap(), 0);
+        assert_eq!(proposal.vote_totals.get(1).unwrap(), 0);
     }
 
     // Regression guard (#581): these three pause-path tests must stay at
     // module scope so the Rust test harness registers each as an independent
     // test. Keep them out of any other test function's body.
     #[test]
-    #[should_panic(expected = "contract is paused")]
     fn test_create_proposal_fails_while_paused() {
         let env = Env::default();
         let (admin, contract_id, _) = setup_token(&env);
         let client = LearnTokenClient::new(&env, &contract_id);
         env.mock_all_auths();
         client.pause(&admin);
-        client.create_proposal(
+        let err = client.try_create_proposal(
             &SorobanString::from_str(&env, "Paused proposal"),
             &2,
             &0,
             &100,
             &env.ledger().sequence(),
-        );
+        ).err().expect("should fail").expect("expected typed error");
+        assert_eq!(err, ContractError::ContractPaused);
     }
 
     #[test]
-    #[should_panic(expected = "contract is paused")]
     fn test_vote_fails_while_paused() {
         let env = Env::default();
         let (admin, contract_id, _) = setup_token(&env);
@@ -973,11 +1010,12 @@ mod token_unit_tests {
             &snap_seq,
         );
         client.pause(&admin);
-        client.vote(&voter, &proposal_id, &0);
+        let err = client.try_vote(&voter, &proposal_id, &0)
+            .err().expect("should fail").expect("expected typed error");
+        assert_eq!(err, ContractError::ContractPaused);
     }
 
     #[test]
-    #[should_panic(expected = "contract is paused")]
     fn test_execute_proposal_fails_while_paused() {
         let env = Env::default();
         let (admin, contract_id, _) = setup_token(&env);
@@ -996,7 +1034,9 @@ mod token_unit_tests {
         );
         env.ledger().with_mut(|ledger| ledger.timestamp = 100);
         client.pause(&admin);
-        client.execute_proposal(&proposal_id);
+        let err = client.try_execute_proposal(&proposal_id)
+            .err().expect("should fail").expect("expected typed error");
+        assert_eq!(err, ContractError::ContractPaused);
     }
 
     #[test]
@@ -1032,13 +1072,14 @@ mod token_unit_tests {
     }
 
     #[test]
-    #[should_panic(expected = "admin transfer delay is below the minimum")]
     fn test_admin_transfer_delay_rejects_zero() {
         let env = Env::default();
         let (_admin, contract_id, _) = setup_token(&env);
         let client = LearnTokenClient::new(&env, &contract_id);
         env.mock_all_auths();
-        client.set_admin_transfer_delay(&0);
+        let err = client.try_set_admin_transfer_delay(&0)
+            .err().expect("should fail").expect("expected typed error");
+        assert_eq!(err, ContractError::NegativeAmount);
     }
 
     #[test]
@@ -1052,13 +1093,14 @@ mod token_unit_tests {
     }
 
     #[test]
-    #[should_panic(expected = "admin transfer delay is below the minimum")]
     fn test_admin_transfer_delay_rejects_below_one_hour() {
         let env = Env::default();
         let (_admin, contract_id, _) = setup_token(&env);
         let client = LearnTokenClient::new(&env, &contract_id);
         env.mock_all_auths();
-        client.set_admin_transfer_delay(&3_599);
+        let err = client.try_set_admin_transfer_delay(&3_599)
+            .err().expect("should fail").expect("expected typed error");
+        assert_eq!(err, ContractError::NegativeAmount);
     }
 
     #[test]
@@ -1122,69 +1164,49 @@ mod token_unit_tests {
     }
 
     #[test]
-    #[should_panic(expected = "cliff not reached")]
     fn test_vesting_cliff_enforced() {
         let env = Env::default();
         let (_admin, contract_id, _) = setup_token(&env);
         let client = LearnTokenClient::new(&env, &contract_id);
         let beneficiary = Address::generate(&env);
-
         env.mock_all_auths();
-
-        env.ledger().with_mut(|l| {
-            l.timestamp = 0;
-        });
-
+        env.ledger().with_mut(|l| l.timestamp = 0);
         client.create_vesting(&beneficiary, &10_000, &100, &1_000);
-
-        // Advance to timestamp 50 (cliff is 100)
-        env.ledger().with_mut(|l| {
-            l.timestamp = 50;
-        });
-
-        client.claim_vested(&beneficiary);
+        env.ledger().with_mut(|l| l.timestamp = 50);
+        let err = client.try_claim_vested(&beneficiary)
+            .err().expect("should fail").expect("expected typed error");
+        assert_eq!(err, ContractError::ExpirationInPast);
     }
 
     #[test]
-    #[should_panic(expected = "vesting schedule fully claimed")]
     fn test_vesting_claiming_after_exhausted_panics() {
         let env = Env::default();
         let (_admin, contract_id, _) = setup_token(&env);
         let client = LearnTokenClient::new(&env, &contract_id);
         let beneficiary = Address::generate(&env);
-
         env.mock_all_auths();
-
-        env.ledger().with_mut(|l| {
-            l.timestamp = 0;
-        });
-
+        env.ledger().with_mut(|l| l.timestamp = 0);
         client.create_vesting(&beneficiary, &10_000, &100, &1_000);
-
-        env.ledger().with_mut(|l| {
-            l.timestamp = 1100;
-        });
-
+        env.ledger().with_mut(|l| l.timestamp = 1100);
         client.claim_vested(&beneficiary);
         assert_eq!(client.balance(&beneficiary), 10_000);
-
-        // Attempting to claim again after schedule is exhausted must panic
-        client.claim_vested(&beneficiary);
+        let err = client.try_claim_vested(&beneficiary)
+            .err().expect("should fail").expect("expected typed error");
+        assert_eq!(err, ContractError::AlreadyInitialized);
     }
 
     #[test]
-    #[should_panic(expected = "vesting amount exceeds remaining supply capacity")]
     fn test_vesting_rejects_amount_above_remaining_supply() {
         let env = Env::default();
         let (admin, contract_id, _) = setup_token_with_max_supply(&env, 1_000);
         let client = LearnTokenClient::new(&env, &contract_id);
         env.mock_all_auths();
-
         let minted = Address::generate(&env);
         client.mint(&admin, &minted, &600);
-
         let beneficiary = Address::generate(&env);
-        client.create_vesting(&beneficiary, &401, &0, &1_000);
+        let err = client.try_create_vesting(&beneficiary, &401, &0, &1_000)
+            .err().expect("should fail").expect("expected typed error");
+        assert_eq!(err, ContractError::MaxSupplyExceeded);
     }
 
     // ── Issue #241: admin transfer delay ─────────────────────────────────────
@@ -1604,27 +1626,27 @@ mod token_unit_tests {
     }
 
     #[test]
-    #[should_panic(expected = "snapshot ledger must match the current ledger")]
     fn test_snapshot_marker_cannot_be_backdated() {
         let env = Env::default();
         let (_admin, contract_id, _) = setup_token(&env);
         let client = LearnTokenClient::new(&env, &contract_id);
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.sequence_number = 100);
-
-        client.snapshot(&99);
+        let err = client.try_snapshot(&99)
+            .err().expect("should fail").expect("expected typed error");
+        assert_eq!(err, ContractError::ExpirationInPast);
     }
 
     #[test]
-    #[should_panic(expected = "snapshot ledger must match the current ledger")]
     fn test_balance_snapshot_cannot_be_backdated() {
         let env = Env::default();
         let (_admin, contract_id, _) = setup_token(&env);
         let client = LearnTokenClient::new(&env, &contract_id);
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.sequence_number = 100);
-
-        client.record_balance_snapshot(&Address::generate(&env), &99);
+        let err = client.try_record_balance_snapshot(&Address::generate(&env), &99)
+            .err().expect("should fail").expect("expected typed error");
+        assert_eq!(err, ContractError::ExpirationInPast);
     }
 
     #[test]
@@ -1842,7 +1864,6 @@ mod token_unit_tests {
     }
 
     #[test]
-    #[should_panic(expected = "maximum supply cap exceeded")]
     fn test_claim_vested_over_supply_cap_panics() {
         let env = Env::default();
         let (_admin, client) = setup_vesting(&env, 10_000);
@@ -1850,18 +1871,20 @@ mod token_unit_tests {
         client.create_vesting(&beneficiary, &10_000, &0, &100);
         client.set_max_supply(&9_999);
         env.ledger().with_mut(|l| l.timestamp = 100);
-
-        client.claim_vested(&beneficiary);
+        let err = client.try_claim_vested(&beneficiary)
+            .err().expect("should fail").expect("expected typed error");
+        assert_eq!(err, ContractError::MaxSupplyExceeded);
     }
 
     #[test]
-    #[should_panic(expected = "vesting amount exceeds remaining supply capacity")]
     fn test_vesting_remaining_supply_check_near_i128_max() {
         let env = Env::default();
         let (admin, client) = setup_vesting(&env, i128::MAX);
         client.mint(&admin, &admin, &(i128::MAX - 10));
         let beneficiary = Address::generate(&env);
-        client.create_vesting(&beneficiary, &11, &0, &100);
+        let err = client.try_create_vesting(&beneficiary, &11, &0, &100)
+            .err().expect("should fail").expect("expected typed error");
+        assert_eq!(err, ContractError::MaxSupplyExceeded);
     }
 
     // ── #522: SEP-41 burn_from unit tests ───────────────────────────────────
@@ -2308,19 +2331,18 @@ mod token_unit_tests {
     }
 
     #[test]
-    #[should_panic(expected = "decrease exceeds allowance")]
     fn test_decrease_allowance_underflow_panics() {
         let env = Env::default();
         let (_admin, contract_id, _) = setup_token(&env);
         let client = LearnTokenClient::new(&env, &contract_id);
-
         let owner = Address::generate(&env);
         let spender = Address::generate(&env);
         env.mock_all_auths();
-
         let exp = env.ledger().sequence() + 1000;
         client.approve(&owner, &spender, &50, &exp);
-        client.decrease_allowance(&owner, &spender, &51);
+        let err = client.try_decrease_allowance(&owner, &spender, &51)
+            .err().expect("should fail").expect("expected typed error");
+        assert_eq!(err, ContractError::InsufficientAllowance);
     }
 
     #[test]
@@ -2381,5 +2403,177 @@ mod token_unit_tests {
                 )
             ]
         );
+    }
+
+    // ── #505: dedicated query-function unit tests ───────────────────────────
+
+    #[test]
+    fn test_get_storage_size_tracks_mint_and_claim_entries() {
+        let env = Env::default();
+        let (admin, contract_id, pt_contract_id) = setup_token(&env);
+        let client = LearnTokenClient::new(&env, &contract_id);
+        let pt_client = ProgressTrackerClient::new(&env, &pt_contract_id);
+        env.mock_all_auths();
+
+        // initialize() records the primary admin role as one tracked entry.
+        assert_eq!(client.get_storage_size(), 1);
+
+        let user = Address::generate(&env);
+        client.mint(&admin, &user, &1_000);
+        assert_eq!(client.get_storage_size(), 2);
+
+        client.mint(&admin, &user, &500);
+        assert_eq!(client.get_storage_size(), 2);
+
+        let learner = Address::generate(&env);
+        let course_id = Symbol::new(&env, "course_1");
+        let quiz_id = Symbol::new(&env, "quiz_1");
+        create_course_and_submit_quiz(&env, &pt_client, &learner, &course_id, &quiz_id, 80);
+        client.claim_reward(&learner, &course_id, &quiz_id);
+        // RewardClaimed + ClaimHistory + TotalMintedTo(learner)
+        assert_eq!(client.get_storage_size(), 5);
+    }
+
+    #[test]
+    fn test_get_vesting_schedule_returns_none_until_created() {
+        let env = Env::default();
+        let (_admin, contract_id, _) = setup_token(&env);
+        let client = LearnTokenClient::new(&env, &contract_id);
+        let beneficiary = Address::generate(&env);
+
+        assert!(client.get_vesting_schedule(&beneficiary).is_none());
+        assert_eq!(client.get_vesting_claimed(&beneficiary), 0);
+
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 50);
+        client.create_vesting(&beneficiary, &10_000, &100, &1_000);
+
+        let schedule = client
+            .get_vesting_schedule(&beneficiary)
+            .expect("schedule should exist after create_vesting");
+        assert_eq!(schedule.total_amount, 10_000);
+        assert_eq!(schedule.cliff_timestamp, 100);
+        assert_eq!(schedule.duration_seconds, 1_000);
+        assert_eq!(schedule.created_at, 50);
+        assert!(!schedule.exhausted);
+        assert!(client
+            .get_vesting_schedule(&Address::generate(&env))
+            .is_none());
+    }
+
+    #[test]
+    fn test_permit_nonce_starts_at_zero_and_increments_only_on_success() {
+        let env = Env::default();
+        let (_admin, contract_id, _) = setup_token(&env);
+        let client = LearnTokenClient::new(&env, &contract_id);
+        env.mock_all_auths();
+
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        assert_eq!(client.permit_nonce(&owner), 0);
+
+        client.permit(&owner, &spender, &100, &1_000, &0);
+        assert_eq!(client.permit_nonce(&owner), 1);
+        client.permit(&owner, &spender, &200, &1_000, &1);
+        assert_eq!(client.permit_nonce(&owner), 2);
+
+        assert!(client
+            .try_permit(&owner, &spender, &300, &1_000, &1)
+            .is_err());
+        assert_eq!(client.permit_nonce(&owner), 2);
+    }
+
+    #[test]
+    fn test_get_admins_lists_primary_and_added_admins() {
+        let env = Env::default();
+        let (admin, contract_id, _) = setup_token(&env);
+        let client = LearnTokenClient::new(&env, &contract_id);
+        env.mock_all_auths();
+
+        let admins = client.get_admins();
+        assert_eq!(admins.len(), 1);
+        assert_eq!(admins.get(0).unwrap().address, admin);
+        assert_eq!(admins.get(0).unwrap().role, AdminRole::Admin);
+
+        let minter = Address::generate(&env);
+        client.add_admin(
+            &admin,
+            &AdminInfo {
+                address: minter.clone(),
+                role: AdminRole::Minter,
+            },
+        );
+
+        let admins = client.get_admins();
+        assert_eq!(admins.len(), 2);
+        assert_eq!(admins.get(1).unwrap().address, minter);
+        assert_eq!(admins.get(1).unwrap().role, AdminRole::Minter);
+
+        client.remove_admin(
+            &admin,
+            &AdminInfo {
+                address: minter.clone(),
+                role: AdminRole::Minter,
+            },
+        );
+        let admins = client.get_admins();
+        assert_eq!(admins.len(), 1);
+        assert_eq!(admins.get(0).unwrap().address, admin);
+    }
+
+    #[test]
+    fn test_has_role_reflects_primary_admin_and_granted_roles() {
+        let env = Env::default();
+        let (admin, contract_id, _) = setup_token(&env);
+        let client = LearnTokenClient::new(&env, &contract_id);
+        env.mock_all_auths();
+
+        assert!(client.has_role(&admin, &AdminRole::Admin));
+        assert!(client.has_role(&admin, &AdminRole::Minter));
+        assert!(client.has_role(&admin, &AdminRole::Pauser));
+
+        let stranger = Address::generate(&env);
+        assert!(!client.has_role(&stranger, &AdminRole::Admin));
+        assert!(!client.has_role(&stranger, &AdminRole::Minter));
+
+        let minter = Address::generate(&env);
+        client.grant_role(&admin, &minter, &AdminRole::Minter);
+        assert!(client.has_role(&minter, &AdminRole::Minter));
+        assert!(!client.has_role(&minter, &AdminRole::Pauser));
+        assert!(!client.has_role(&minter, &AdminRole::Admin));
+
+        client.revoke_role(&admin, &minter, &AdminRole::Minter);
+        assert!(!client.has_role(&minter, &AdminRole::Minter));
+    }
+
+    #[test]
+    fn test_prune_expired_allowance_removes_expired_entry_only() {
+        let env = Env::default();
+        let (_admin, contract_id, _) = setup_token(&env);
+        let client = LearnTokenClient::new(&env, &contract_id);
+        env.mock_all_auths();
+
+        let owner = Address::generate(&env);
+        let expired_spender = Address::generate(&env);
+        let active_spender = Address::generate(&env);
+        let expiring_ledger = env.ledger().sequence() + 5;
+        let valid_ledger = env.ledger().sequence() + 999_999;
+
+        client.approve(&owner, &expired_spender, &100, &expiring_ledger);
+        client.approve(&owner, &active_spender, &200, &valid_ledger);
+        assert!(!client.prune_expired_allowance(&owner, &expired_spender));
+        assert_eq!(client.allowance_spender_count(&owner), 2);
+
+        env.ledger().with_mut(|l| {
+            l.sequence_number = expiring_ledger + 1;
+        });
+
+        assert!(client.prune_expired_allowance(&owner, &expired_spender));
+        assert_eq!(client.allowance(&owner, &expired_spender), 0);
+        assert_eq!(client.allowance(&owner, &active_spender), 200);
+        assert_eq!(client.allowance_spender_count(&owner), 1);
+        assert!(!client.prune_expired_allowance(&owner, &expired_spender));
+        assert!(!client.prune_expired_allowance(&owner, &active_spender));
+        assert!(!client.prune_expired_allowance(&owner, &Address::generate(&env)));
     }
 }

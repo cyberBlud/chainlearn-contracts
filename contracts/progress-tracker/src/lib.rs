@@ -6,11 +6,11 @@ pub mod types;
 
 use chainlearn_shared::ContractMetadata;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, Address, BytesN, Env, Symbol, Vec,
+    contract, contracterror, contractimpl, panic_with_error, Address, BytesN, Env, Symbol, Vec,
 };
 pub use types::{
-    Achievement, AchievementType, Course, LearnerStats, ProgressExport, ProgressInfo,
-    ProgressTrackerDataKey, QuizResult, VersionedContractMetadata,
+    Achievement, AchievementType, AdminRole, Course, LearnerStats, ProgressExport, ProgressInfo,
+    ProgressTrackerDataKey, QuizResult, RoleKey, VersionedContractMetadata,
 };
 
 /// Sentinel meaning "no content hash set"; enrollment skips verification (#235).
@@ -21,6 +21,25 @@ const EMPTY_CONTENT_HASH: &str = "none";
 #[repr(u32)]
 pub enum ContractError {
     AlreadyInitialized = 0,
+    /// Caller does not have the required role (#551).
+    NotAuthorized = 1,
+    ContractPaused = 2,
+    NotFound = 3,
+    AlreadyEnrolled = 4,
+    DuplicateModule = 5,
+    DuplicateQuiz = 6,
+    InvalidScore = 7,
+    OutOfOrder = 8,
+    AlreadyExists = 9,
+    InvalidInput = 10,
+    AlreadyCompleted = 11,
+    AlreadySubmitted = 12,
+    Archived = 13,
+    PrerequisiteNotCompleted = 14,
+    ContentHashMismatch = 15,
+    InvalidState = 16,
+    InvalidAddress = 17,
+    DelayNotElapsed = 18,
 }
 
 /// On-chain learning progress tracker for ChainLearn.
@@ -42,6 +61,8 @@ impl ProgressTracker {
             return Err(ContractError::AlreadyInitialized);
         }
         types::write_entry(&env, &ProgressTrackerDataKey::Admin, &admin);
+        // Grant Admin role to the initial admin (#551).
+        types::grant_role(&env, &admin, &types::AdminRole::Admin);
         types::write_entry(
             &env,
             &ProgressTrackerDataKey::Metadata,
@@ -228,7 +249,13 @@ impl ProgressTracker {
             Self::add_course_to_tag_index(&env, &tag, &course_id);
         }
 
-        events::course_created(&env, &course_id, total_modules, total_quizzes, module_ids.clone());
+        events::course_created(
+            &env,
+            &course_id,
+            total_modules,
+            total_quizzes,
+            module_ids.clone(),
+        );
     }
 
     /// Enroll a learner in a course.
@@ -538,7 +565,13 @@ impl ProgressTracker {
             progress,
         );
 
-        events::module_completed(env, learner, course_id, &module_id, progress.overall_progress);
+        events::module_completed(
+            env,
+            learner,
+            course_id,
+            &module_id,
+            progress.overall_progress,
+        );
 
         // Notify indexers the moment eligibility flips to true, instead of
         // requiring them to poll get_progress (#96).
@@ -935,14 +968,7 @@ impl ProgressTracker {
             &progress,
         );
 
-        events::quiz_retaken(
-            env,
-            learner,
-            course_id,
-            &quiz_id,
-            previous_score,
-            new_score,
-        );
+        events::quiz_retaken(env, learner, course_id, &quiz_id, previous_score, new_score);
 
         // Notify indexers the moment eligibility flips to true, instead of
         // requiring them to poll get_progress (#96).
@@ -1813,34 +1839,30 @@ impl ProgressTracker {
         }
     }
 
-    /// Pause all state-changing operations. Admin only.
-    pub fn emergency_pause(env: Env) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&ProgressTrackerDataKey::Admin)
-            .expect("not initialized");
-        admin.require_auth();
+    /// Pause all state-changing operations. Admin or Pauser role required (#551).
+    pub fn pause(env: Env, caller: Address) {
+        caller.require_auth();
+        if !types::has_role(&env, &caller, &types::AdminRole::Pauser) {
+            panic_with_error!(&env, ContractError::NotAuthorized);
+        }
         if Self::is_paused(&env) {
             panic!("already paused");
         }
         types::write_entry(&env, &ProgressTrackerDataKey::Paused, &true);
-        events::paused(&env, &admin, env.ledger().timestamp());
+        events::paused(&env, &caller, env.ledger().timestamp());
     }
 
-    /// Unpause state-changing operations. Admin only.
-    pub fn unpause(env: Env) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&ProgressTrackerDataKey::Admin)
-            .expect("not initialized");
-        admin.require_auth();
+    /// Unpause state-changing operations. Admin or Pauser role required (#551).
+    pub fn unpause(env: Env, caller: Address) {
+        caller.require_auth();
+        if !types::has_role(&env, &caller, &types::AdminRole::Pauser) {
+            panic_with_error!(&env, ContractError::NotAuthorized);
+        }
         if !Self::is_paused(&env) {
             panic!("not paused");
         }
         types::write_entry(&env, &ProgressTrackerDataKey::Paused, &false);
-        events::unpaused(&env, &admin, env.ledger().timestamp());
+        events::unpaused(&env, &caller, env.ledger().timestamp());
     }
 
     /// Returns the admin address.
@@ -2079,10 +2101,7 @@ impl ProgressTracker {
     pub fn revoke_delegation(env: Env, learner: Address) {
         learner.require_auth();
 
-        types::remove_entry(
-            &env,
-            &ProgressTrackerDataKey::DelegatedTo(learner.clone()),
-        );
+        types::remove_entry(&env, &ProgressTrackerDataKey::DelegatedTo(learner.clone()));
 
         events::delegation_revoked(&env, &learner);
     }
@@ -2397,18 +2416,17 @@ impl ProgressTracker {
 
     // ── Upgradeability ────────────────────────────────────────────────────────
 
-    /// Upgrade the contract to a new Wasm code.
+    /// Upgrade the contract to a new Wasm code. Admin role required (#551).
     ///
     /// # Arguments
+    /// * `caller` - The admin performing the upgrade (must authorize)
     /// * `new_wasm_hash` - Hash of the already-uploaded wasm to install
-    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+    pub fn upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) {
         Self::require_not_paused(&env);
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&ProgressTrackerDataKey::Admin)
-            .expect("not initialized");
-        admin.require_auth();
+        caller.require_auth();
+        if !types::has_role(&env, &caller, &types::AdminRole::Admin) {
+            panic_with_error!(&env, ContractError::NotAuthorized);
+        }
 
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
@@ -2424,6 +2442,47 @@ impl ProgressTracker {
         types::write_entry(&env, &ProgressTrackerDataKey::Version, &version);
 
         events::upgraded(&env, &new_wasm_hash, version);
+    }
+
+    /// Grant a role to an address. Admin only (#551).
+    ///
+    /// # Arguments
+    /// * `caller` - The admin granting the role (must authorize)
+    /// * `address` - The address to receive the role
+    /// * `role` - The role to grant
+    pub fn grant_role(env: Env, caller: Address, address: Address, role: types::AdminRole) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+        if !types::has_role(&env, &caller, &types::AdminRole::Admin) {
+            panic_with_error!(&env, ContractError::NotAuthorized);
+        }
+        types::grant_role(&env, &address, &role);
+        events::role_granted(&env, &address, &role);
+    }
+
+    /// Revoke a role from an address. Admin only (#551).
+    ///
+    /// # Arguments
+    /// * `caller` - The admin revoking the role (must authorize)
+    /// * `address` - The address to lose the role
+    /// * `role` - The role to revoke
+    pub fn revoke_role(env: Env, caller: Address, address: Address, role: types::AdminRole) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+        if !types::has_role(&env, &caller, &types::AdminRole::Admin) {
+            panic_with_error!(&env, ContractError::NotAuthorized);
+        }
+        types::revoke_role(&env, &address, &role);
+        events::role_revoked(&env, &address, &role);
+    }
+
+    /// Check whether an address has a specific role (#551).
+    ///
+    /// # Arguments
+    /// * `address` - The address to check
+    /// * `role` - The role to check
+    pub fn has_role(env: Env, address: Address, role: types::AdminRole) -> bool {
+        types::has_role(&env, &address, &role)
     }
 
     /// Wasm hash the contract was most recently upgraded to, or `None` if
@@ -2478,7 +2537,7 @@ mod tests {
     #[test]
     fn test_initialize_stores_contract_metadata() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         let metadata = client.contract_metadata();
@@ -2497,7 +2556,7 @@ mod tests {
     #[test]
     fn test_contract_version_starts_at_zero() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         assert_eq!(client.contract_version(), 0);
@@ -2506,7 +2565,7 @@ mod tests {
     #[test]
     fn test_contract_metadata_includes_version() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         let metadata = client.contract_metadata();
@@ -2519,7 +2578,7 @@ mod tests {
     #[test]
     fn test_course_exists() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2534,7 +2593,7 @@ mod tests {
     #[test]
     fn test_course_content_hash_defaults_to_unset() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2549,7 +2608,7 @@ mod tests {
     #[test]
     fn test_set_and_query_course_content_hash() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2565,7 +2624,7 @@ mod tests {
     #[test]
     fn test_course_content_hash_can_be_updated() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2583,7 +2642,7 @@ mod tests {
     #[test]
     fn test_enroll_without_hash_is_unaffected_by_verification() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2603,7 +2662,7 @@ mod tests {
     #[test]
     fn test_enroll_checked_accepts_matching_hash() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2624,7 +2683,7 @@ mod tests {
     #[should_panic(expected = "course content hash mismatch")]
     fn test_enroll_checked_rejects_mismatched_hash() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2638,7 +2697,7 @@ mod tests {
     #[test]
     fn test_enroll_checked_skips_verification_when_hash_unset() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2658,7 +2717,7 @@ mod tests {
     #[test]
     fn test_enroll_checked_with_none_skips_verification() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2678,14 +2737,14 @@ mod tests {
     #[should_panic(expected = "contract is paused")]
     fn test_enroll_checked_panics_when_paused() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
         let course_id = create_test_course(&env, &client);
         let learner = Address::generate(&env);
 
-        client.emergency_pause();
+        client.pause(&admin);
         client.enroll_checked(&learner, &course_id, &None);
     }
 
@@ -2694,7 +2753,7 @@ mod tests {
     #[test]
     fn test_course_updated_at_defaults_to_creation_time() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2708,7 +2767,7 @@ mod tests {
     #[test]
     fn test_course_updated_at_changes_on_modification() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2747,7 +2806,7 @@ mod tests {
     #[test]
     fn test_course_updated_at_is_queryable_via_get_course() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2763,7 +2822,7 @@ mod tests {
     #[test]
     fn test_get_course_score_single_quiz() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2778,7 +2837,7 @@ mod tests {
     #[test]
     fn test_get_course_score_averages_submitted_quizzes() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2794,7 +2853,7 @@ mod tests {
     #[test]
     fn test_get_course_score_floors_the_average() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2811,7 +2870,7 @@ mod tests {
     #[test]
     fn test_get_course_score_is_per_learner() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2831,7 +2890,7 @@ mod tests {
     #[test]
     fn test_get_course_score_returns_zero_without_submissions() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2846,7 +2905,7 @@ mod tests {
     #[should_panic(expected = "not enrolled")]
     fn test_get_course_score_for_unenrolled_learner_panics() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2859,7 +2918,7 @@ mod tests {
     #[test]
     fn test_enroll_and_get_progress() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2876,7 +2935,7 @@ mod tests {
     #[test]
     fn test_complete_module() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2893,7 +2952,7 @@ mod tests {
     #[test]
     fn test_submit_quiz_score() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2915,7 +2974,7 @@ mod tests {
     #[test]
     fn test_export_progress() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2949,7 +3008,7 @@ mod tests {
     #[test]
     fn test_export_progress_omits_unsubmitted_quizzes() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2973,7 +3032,7 @@ mod tests {
     #[should_panic(expected = "not enrolled")]
     fn test_export_progress_not_enrolled() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -2986,7 +3045,7 @@ mod tests {
     #[test]
     fn test_eligibility_after_completion() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3013,7 +3072,7 @@ mod tests {
     #[should_panic(expected = "not enrolled")]
     fn test_get_progress_not_enrolled() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3027,7 +3086,7 @@ mod tests {
     #[should_panic(expected = "already enrolled")]
     fn test_double_enroll() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3042,7 +3101,7 @@ mod tests {
     #[should_panic(expected = "course already exists")]
     fn test_create_course_rejects_duplicate() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3061,7 +3120,7 @@ mod tests {
     #[should_panic(expected = "duplicate quiz_id found")]
     fn test_create_course_rejects_duplicate_quiz_ids() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3083,7 +3142,7 @@ mod tests {
     #[test]
     fn test_create_course_accepts_distinct_quiz_ids() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3102,7 +3161,7 @@ mod tests {
     #[test]
     fn test_quiz_result_not_duplicated_in_progress() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3135,7 +3194,7 @@ mod tests {
     #[should_panic(expected = "not enrolled")]
     fn test_is_eligible_rejects_unenrolled_learner() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3148,7 +3207,7 @@ mod tests {
     #[test]
     fn test_is_eligible_for_enrolled_learner() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3173,7 +3232,7 @@ mod tests {
     fn test_create_course_event_emitted() {
         let env = Env::default();
         env.mock_all_auths();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         let course_id = Symbol::new(&env, "sol_201");
@@ -3197,7 +3256,7 @@ mod tests {
     #[should_panic(expected = "quiz not submitted")]
     fn test_get_quiz_score_unsubmitted() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3213,7 +3272,7 @@ mod tests {
     #[test]
     fn test_enroll_event_includes_timestamp() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3251,7 +3310,7 @@ mod tests {
     #[test]
     fn test_credential_eligible_event_emitted_on_flip_to_true() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3317,7 +3376,7 @@ mod tests {
     #[test]
     fn test_course_carries_module_ids() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3346,7 +3405,7 @@ mod tests {
     #[test]
     fn test_is_eligible_for_credential_returns_cached_field() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3402,7 +3461,7 @@ mod tests {
     #[test]
     fn test_courses_have_no_prerequisites_by_default() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3415,7 +3474,7 @@ mod tests {
     #[test]
     fn test_set_and_get_prerequisites() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3434,7 +3493,7 @@ mod tests {
     #[test]
     fn test_set_prerequisites_emits_event() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3456,7 +3515,7 @@ mod tests {
     #[test]
     fn test_set_prerequisites_replaces_previous_list() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3477,7 +3536,7 @@ mod tests {
     #[should_panic(expected = "prerequisite not completed")]
     fn test_enroll_rejects_learner_without_prerequisite() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3497,7 +3556,7 @@ mod tests {
     #[should_panic(expected = "prerequisite not completed")]
     fn test_enroll_rejects_learner_with_incomplete_prerequisite() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3520,7 +3579,7 @@ mod tests {
     #[test]
     fn test_enroll_allows_learner_who_completed_prerequisite() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3542,7 +3601,7 @@ mod tests {
     #[should_panic(expected = "prerequisite not completed")]
     fn test_enroll_requires_every_prerequisite() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3571,7 +3630,7 @@ mod tests {
     #[test]
     fn test_enroll_unaffected_when_course_has_no_prerequisites() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3589,7 +3648,7 @@ mod tests {
     #[should_panic(expected = "prerequisite course not found")]
     fn test_set_prerequisites_rejects_unknown_course() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3604,7 +3663,7 @@ mod tests {
     #[should_panic(expected = "course cannot be its own prerequisite")]
     fn test_set_prerequisites_rejects_self_reference() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3619,7 +3678,7 @@ mod tests {
     #[should_panic(expected = "duplicate prerequisite found")]
     fn test_set_prerequisites_rejects_duplicates() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3636,7 +3695,7 @@ mod tests {
     #[should_panic(expected = "course not found")]
     fn test_set_prerequisites_on_unknown_course_panics() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3647,7 +3706,7 @@ mod tests {
     #[should_panic(expected = "course not found")]
     fn test_get_prerequisites_on_unknown_course_panics() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         client.get_prerequisites(&Symbol::new(&env, "ghost_course"));
@@ -3671,7 +3730,7 @@ mod tests {
     #[test]
     fn test_learner_stats_for_learner_with_no_enrollments() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         let stranger = Address::generate(&env);
@@ -3688,7 +3747,7 @@ mod tests {
     #[test]
     fn test_learner_stats_counts_enrollments() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3707,7 +3766,7 @@ mod tests {
     #[test]
     fn test_learner_stats_aggregates_across_courses() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3735,7 +3794,7 @@ mod tests {
     #[test]
     fn test_learner_stats_floors_the_average() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3753,7 +3812,7 @@ mod tests {
     #[test]
     fn test_learner_stats_counts_completed_courses() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3781,7 +3840,7 @@ mod tests {
     #[test]
     fn test_learner_stats_is_per_learner() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3802,7 +3861,7 @@ mod tests {
     #[test]
     fn test_learner_stats_ignores_quizless_courses_in_average() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3824,7 +3883,7 @@ mod tests {
     #[test]
     fn test_get_learner_courses_lists_enrollments_in_order() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3848,7 +3907,7 @@ mod tests {
     #[test]
     fn test_completion_percentage_starts_at_zero() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3862,7 +3921,7 @@ mod tests {
     #[test]
     fn test_completion_percentage_matches_stored_progress() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3883,7 +3942,7 @@ mod tests {
     #[test]
     fn test_completion_percentage_reaches_one_hundred() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3903,7 +3962,7 @@ mod tests {
     #[test]
     fn test_completion_percentage_does_not_change_state() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3924,7 +3983,7 @@ mod tests {
     #[test]
     fn test_completion_percentage_is_per_learner_and_course() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3947,7 +4006,7 @@ mod tests {
     #[should_panic(expected = "not enrolled")]
     fn test_completion_percentage_for_unenrolled_learner_panics() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -3960,7 +4019,7 @@ mod tests {
     // ── Issue #422: pause/unpause must be observable ─────────────────────
 
     #[test]
-    fn test_emergency_pause_emits_paused_event() {
+    fn test_pause_emits_paused_event() {
         let env = Env::default();
         let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
@@ -3968,7 +4027,7 @@ mod tests {
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 42_000);
 
-        client.emergency_pause();
+        client.pause(&admin);
 
         let all = env.events().all();
         let last = all.last().expect("no event emitted");
@@ -3994,10 +4053,10 @@ mod tests {
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 43_500);
 
-        client.emergency_pause();
+        client.pause(&admin);
         env.events().all(); // discard the pause event
 
-        client.unpause();
+        client.unpause(&admin);
 
         let all = env.events().all();
         let last = all.last().expect("no event emitted");
@@ -4016,25 +4075,25 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "already paused")]
-    fn test_emergency_pause_rejects_double_pause() {
+    fn test_pause_rejects_double_pause() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
         env.mock_all_auths();
 
-        client.emergency_pause();
-        client.emergency_pause();
+        client.pause(&admin);
+        client.pause(&admin);
     }
 
     #[test]
     #[should_panic(expected = "not paused")]
     fn test_unpause_rejects_when_not_paused() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
         env.mock_all_auths();
 
-        client.unpause();
+        client.unpause(&admin);
     }
 
     // ── Issue #423: delayed two-step admin transfer ──────────────────────
@@ -4058,7 +4117,7 @@ mod tests {
     #[test]
     fn test_accept_admin_completes_the_transfer_after_the_delay() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
         let new_admin = Address::generate(&env);
 
@@ -4076,7 +4135,7 @@ mod tests {
     #[should_panic(expected = "admin transfer delay has not elapsed")]
     fn test_accept_admin_panics_before_the_delay_elapses() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
         let new_admin = Address::generate(&env);
 
@@ -4106,7 +4165,7 @@ mod tests {
     #[should_panic(expected = "no pending admin transfer")]
     fn test_accept_admin_panics_after_cancellation() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
         let new_admin = Address::generate(&env);
 
@@ -4120,7 +4179,7 @@ mod tests {
     #[test]
     fn test_pending_transfer_is_overwritten_by_a_later_candidate() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
         let first = Address::generate(&env);
         let second = Address::generate(&env);
@@ -4138,7 +4197,7 @@ mod tests {
     #[test]
     fn test_default_admin_transfer_delay_matches_learn_token() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         assert_eq!(client.admin_transfer_delay(), 172_800);
@@ -4148,7 +4207,7 @@ mod tests {
     #[should_panic(expected = "admin transfer delay is below the minimum")]
     fn test_set_admin_transfer_delay_rejects_zero() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4161,7 +4220,7 @@ mod tests {
     #[should_panic(expected = "admin transfer delay is below the minimum")]
     fn test_set_admin_transfer_delay_rejects_below_one_hour() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4171,7 +4230,7 @@ mod tests {
     #[test]
     fn test_set_admin_transfer_delay_accepts_one_hour_minimum() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4183,7 +4242,7 @@ mod tests {
     #[should_panic(expected = "admin transfer delay has not elapsed")]
     fn test_accept_admin_honors_the_configured_minimum_delay() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
         let new_admin = Address::generate(&env);
 
@@ -4198,7 +4257,7 @@ mod tests {
     #[test]
     fn test_set_admin_transfer_delay_requires_admin_auth() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         // No authorization is mocked, so the admin-only call must be rejected
@@ -4206,14 +4265,237 @@ mod tests {
         assert!(client.try_set_admin_transfer_delay(&3_600).is_err());
     }
 
+    // ── Issue #538: admin transfer unit tests (events, auth, lifecycle) ───
+
+    #[test]
+    fn test_transfer_admin_emits_initiated_event() {
+        let env = Env::default();
+        let (admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+        let new_admin = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.transfer_admin(&new_admin);
+
+        let events = env.events().all();
+        let (_, topics, data) = events.last().unwrap();
+        assert_eq!(
+            topics,
+            (
+                Symbol::new(&env, "admin_transfer_initiated"),
+                new_admin.clone()
+            )
+                .into_val(&env)
+        );
+        // Data: (current_admin, initiated_at, accept_after). The ledger starts
+        // at timestamp 0 and the default delay is 48h, so accept_after is the
+        // default delay exactly.
+        let data_vec: soroban_sdk::Vec<soroban_sdk::Val> = data.into_val(&env);
+        assert_eq!(data_vec.len(), 3);
+        let data_admin: Address = data_vec.get(0).unwrap().into_val(&env);
+        let initiated_at: u64 = data_vec.get(1).unwrap().into_val(&env);
+        let accept_after: u64 = data_vec.get(2).unwrap().into_val(&env);
+        assert_eq!(data_admin, admin);
+        assert_eq!(initiated_at, 0);
+        assert_eq!(accept_after, 172_800);
+    }
+
+    #[test]
+    fn test_transfer_admin_requires_admin_auth() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+        let new_admin = Address::generate(&env);
+
+        // No authorization is mocked, so the admin-only call must be rejected
+        // and no pending transfer may be recorded.
+        assert!(client.try_transfer_admin(&new_admin).is_err());
+        assert!(client.pending_admin().is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot transfer admin to zero address")]
+    fn test_transfer_admin_rejects_zero_address() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+
+        env.mock_all_auths();
+        client.transfer_admin(&chainlearn_shared::zero_address(&env));
+    }
+
+    #[test]
+    fn test_cancel_admin_transfer_emits_cancelled_event() {
+        let env = Env::default();
+        let (admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+        let new_admin = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.transfer_admin(&new_admin);
+        client.cancel_admin_transfer();
+
+        let events = env.events().all();
+        let (_, topics, data) = events.last().unwrap();
+        assert_eq!(
+            topics,
+            (
+                Symbol::new(&env, "admin_transfer_cancelled"),
+                new_admin.clone()
+            )
+                .into_val(&env)
+        );
+        // Data: (current_admin,).
+        let data_vec: soroban_sdk::Vec<soroban_sdk::Val> = data.into_val(&env);
+        assert_eq!(data_vec.len(), 1);
+        let data_admin: Address = data_vec.get(0).unwrap().into_val(&env);
+        assert_eq!(data_admin, admin);
+    }
+
+    #[test]
+    fn test_cancel_admin_transfer_requires_admin_auth() {
+        let env = Env::default();
+        let (admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+        let new_admin = Address::generate(&env);
+
+        // Seed a pending transfer directly so the only thing that can reject
+        // an unauthenticated cancel is the admin auth check itself.
+        env.as_contract(&contract_id, || {
+            types::write_entry(
+                &env,
+                &ProgressTrackerDataKey::PendingAdmin,
+                &types::PendingAdminTransfer {
+                    new_admin: new_admin.clone(),
+                    initiated_at: 0,
+                },
+            );
+        });
+
+        assert!(client.try_cancel_admin_transfer().is_err());
+        // The pending transfer and the admin are both untouched.
+        assert_eq!(client.admin(), admin);
+        let pending = client.pending_admin().expect("no pending transfer");
+        assert_eq!(pending.new_admin, new_admin);
+    }
+
+    #[test]
+    fn test_accept_admin_emits_accepted_event() {
+        let env = Env::default();
+        let (admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+        let new_admin = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.transfer_admin(&new_admin);
+        // Advance past the default 48h delay.
+        env.ledger().with_mut(|l| l.timestamp += 172_801);
+        client.accept_admin();
+
+        let events = env.events().all();
+        let (_, topics, data) = events.last().unwrap();
+        assert_eq!(
+            topics,
+            (
+                Symbol::new(&env, "admin_transfer_accepted"),
+                new_admin.clone()
+            )
+                .into_val(&env)
+        );
+        // Data: (previous_admin,).
+        let data_vec: soroban_sdk::Vec<soroban_sdk::Val> = data.into_val(&env);
+        assert_eq!(data_vec.len(), 1);
+        let data_admin: Address = data_vec.get(0).unwrap().into_val(&env);
+        assert_eq!(data_admin, admin);
+    }
+
+    #[test]
+    fn test_accept_admin_requires_pending_new_admin_auth() {
+        let env = Env::default();
+        let (admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+        let new_admin = Address::generate(&env);
+
+        // Seed a pending transfer whose delay has fully elapsed, without any
+        // auth mocking for the accept call, so the only thing that can reject
+        // it is the pending candidate's require_auth.
+        env.ledger().with_mut(|l| l.timestamp += 172_801);
+        env.as_contract(&contract_id, || {
+            types::write_entry(
+                &env,
+                &ProgressTrackerDataKey::PendingAdmin,
+                &types::PendingAdminTransfer {
+                    new_admin: new_admin.clone(),
+                    initiated_at: 0,
+                },
+            );
+        });
+
+        assert!(client.try_accept_admin().is_err());
+        // The admin is unchanged and the pending transfer survives.
+        assert_eq!(client.admin(), admin);
+        let pending = client.pending_admin().expect("no pending transfer");
+        assert_eq!(pending.new_admin, new_admin);
+    }
+
+    #[test]
+    fn test_pending_admin_reports_the_full_lifecycle() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+        let new_admin = Address::generate(&env);
+
+        // Absent before any transfer is initiated.
+        assert!(client.pending_admin().is_none());
+
+        env.mock_all_auths();
+        client.transfer_admin(&new_admin);
+
+        // Present after transfer_admin, stamped with the initiation time.
+        let pending = client.pending_admin().expect("no pending transfer");
+        assert_eq!(pending.new_admin, new_admin);
+        assert_eq!(pending.initiated_at, env.ledger().timestamp());
+
+        // Absent again once the current admin cancels.
+        client.cancel_admin_transfer();
+        assert!(client.pending_admin().is_none());
+
+        // And absent again after a completed transfer.
+        client.transfer_admin(&new_admin);
+        env.ledger().with_mut(|l| l.timestamp += 172_801);
+        client.accept_admin();
+        assert!(client.pending_admin().is_none());
+        assert_eq!(client.admin(), new_admin);
+    }
+
+    #[test]
+    fn test_set_admin_transfer_delay_accepts_larger_values() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+
+        env.mock_all_auths();
+        client.set_admin_transfer_delay(&86_400);
+        assert_eq!(client.admin_transfer_delay(), 86_400);
+
+        // The configured delay applies to transfers initiated after the change.
+        let new_admin = Address::generate(&env);
+        client.transfer_admin(&new_admin);
+        env.ledger().with_mut(|l| l.timestamp += 86_399);
+        assert!(client.try_accept_admin().is_err());
+        env.ledger().with_mut(|l| l.timestamp += 1);
+        client.accept_admin();
+        assert_eq!(client.admin(), new_admin);
+    }
+
     // ── Issue #457: course mutations must respect the pause state ───────
 
     fn paused_course(env: &Env) -> (Address, Symbol) {
-        let (_admin, contract_id) = setup_contract(env);
+        let (admin, contract_id) = setup_contract(env);
         let client = ProgressTrackerClient::new(env, &contract_id);
         env.mock_all_auths();
         let course_id = create_test_course(env, &client);
-        client.emergency_pause();
+        client.pause(&admin);
         (contract_id, course_id)
     }
 
@@ -4267,7 +4549,8 @@ mod tests {
         let env = Env::default();
         let (contract_id, course_id) = paused_course(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
-        client.unpause();
+        let admin = client.admin();
+        client.unpause(&admin);
 
         let content_hash = Symbol::new(&env, "new_hash");
         client.set_course_content_hash(&course_id, &content_hash);
@@ -4288,7 +4571,7 @@ mod tests {
     #[should_panic(expected = "contract is paused")]
     fn test_retake_quiz_panics_when_paused() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4299,7 +4582,7 @@ mod tests {
         client.enroll(&learner, &course_id);
         client.submit_quiz_score(&learner, &course_id, &quiz_1, &55);
 
-        client.emergency_pause();
+        client.pause(&admin);
         // The learner has to be able to retry for real once the pause lifts
         // (covered below), so this must be the pause rejecting the call and
         // not some other guard firing first.
@@ -4310,7 +4593,7 @@ mod tests {
     #[should_panic(expected = "contract is paused")]
     fn test_retake_quiz_for_panics_when_paused() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4323,14 +4606,14 @@ mod tests {
         client.submit_quiz_score(&learner, &course_id, &quiz_1, &55);
         client.delegate_progress(&learner, &delegate);
 
-        client.emergency_pause();
+        client.pause(&admin);
         client.retake_quiz_for(&delegate, &learner, &course_id, &quiz_1, &90);
     }
 
     #[test]
     fn test_retake_quiz_succeeds_after_unpause() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4341,8 +4624,8 @@ mod tests {
         client.enroll(&learner, &course_id);
         client.submit_quiz_score(&learner, &course_id, &quiz_1, &55);
 
-        client.emergency_pause();
-        client.unpause();
+        client.pause(&admin);
+        client.unpause(&admin);
 
         // Unpaused retakes still work, so the new guard is not a blanket ban.
         client.retake_quiz(&learner, &course_id, &quiz_1, &90);
@@ -4352,7 +4635,7 @@ mod tests {
     #[test]
     fn test_retake_quiz_for_succeeds_after_unpause() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4365,7 +4648,11 @@ mod tests {
         client.submit_quiz_score(&learner, &course_id, &quiz_1, &55);
         client.delegate_progress(&learner, &delegate);
 
-        client.unpause();
+        // The test name says "succeeds after unpause" but the sequence above never
+        // paused the contract. Pause first, then unpause before the delegate
+        // retake call to actually exercise the post-unpause path.
+        client.pause(&admin);
+        client.unpause(&admin);
         // Delegate path still works once the pause lifts, mirroring the
         // direct path above.
         client.retake_quiz_for(&delegate, &learner, &course_id, &quiz_1, &90);
@@ -4376,21 +4663,21 @@ mod tests {
     #[should_panic(expected = "contract is paused")]
     fn test_delegate_progress_panics_when_paused() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
         let learner = Address::generate(&env);
         let delegate = Address::generate(&env);
 
-        client.emergency_pause();
+        client.pause(&admin);
         client.delegate_progress(&learner, &delegate);
     }
 
     #[test]
     fn test_revoke_delegation_succeeds_when_paused() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4400,7 +4687,7 @@ mod tests {
         client.delegate_progress(&learner, &delegate);
         assert_eq!(client.delegated_to(&learner), Some(delegate));
 
-        client.emergency_pause();
+        client.pause(&admin);
 
         let other = Address::generate(&env);
         assert!(client.try_delegate_progress(&learner, &other).is_err());
@@ -4414,7 +4701,7 @@ mod tests {
     #[test]
     fn test_retake_quiz_replaces_the_score() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4432,7 +4719,7 @@ mod tests {
     #[test]
     fn test_retake_quiz_updates_the_average() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4455,7 +4742,7 @@ mod tests {
     #[test]
     fn test_retake_quiz_does_not_double_count_the_quiz() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4475,7 +4762,7 @@ mod tests {
     #[test]
     fn test_retake_quiz_updates_overall_progress() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4495,7 +4782,7 @@ mod tests {
     #[test]
     fn test_retake_quiz_can_unlock_credential_eligibility() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4522,7 +4809,7 @@ mod tests {
     #[test]
     fn test_retake_quiz_emits_event() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4545,13 +4832,21 @@ mod tests {
             )
                 .into_val(&env)
         );
-        assert_eq!(*data, (quiz_1, 55u32, 75u32).into_val(&env));
+        // Data: (quiz_id, previous_score, new_score).
+        let data_vec: soroban_sdk::Vec<soroban_sdk::Val> = data.into_val(&env);
+        assert_eq!(data_vec.len(), 3);
+        let data_quiz: Symbol = data_vec.get(0).unwrap().into_val(&env);
+        let previous_score: u32 = data_vec.get(1).unwrap().into_val(&env);
+        let new_score: u32 = data_vec.get(2).unwrap().into_val(&env);
+        assert_eq!(data_quiz, quiz_1);
+        assert_eq!(previous_score, 55);
+        assert_eq!(new_score, 75);
     }
 
     #[test]
     fn test_retake_quiz_updates_the_submission_timestamp() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4574,7 +4869,7 @@ mod tests {
     #[test]
     fn test_retake_quiz_can_be_repeated_while_improving() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4598,7 +4893,7 @@ mod tests {
     #[should_panic(expected = "score must be greater than 0")]
     fn test_retake_quiz_rejects_zero_score() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4615,7 +4910,7 @@ mod tests {
     #[should_panic(expected = "new score must be higher")]
     fn test_retake_quiz_rejects_lower_score() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4632,7 +4927,7 @@ mod tests {
     #[should_panic(expected = "new score must be higher")]
     fn test_retake_quiz_rejects_equal_score() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4649,7 +4944,7 @@ mod tests {
     #[should_panic(expected = "score exceeds maximum")]
     fn test_retake_quiz_rejects_score_above_maximum() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4666,7 +4961,7 @@ mod tests {
     #[should_panic(expected = "quiz not submitted")]
     fn test_retake_quiz_rejects_quiz_never_taken() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4681,7 +4976,7 @@ mod tests {
     #[should_panic(expected = "not enrolled")]
     fn test_retake_quiz_rejects_unenrolled_learner() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4694,7 +4989,7 @@ mod tests {
     #[test]
     fn test_retake_quiz_feeds_learner_stats() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4718,7 +5013,7 @@ mod tests {
     #[test]
     fn test_get_course_difficulty_defaults_to_beginner() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4730,7 +5025,7 @@ mod tests {
     #[test]
     fn test_set_course_difficulty_supports_all_levels() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4745,7 +5040,7 @@ mod tests {
     #[test]
     fn test_set_course_difficulty_emits_event() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4753,24 +5048,26 @@ mod tests {
         client.set_course_difficulty(&course_id, &2);
 
         let events = env.events().all();
-        let (_, topics, _data) = events.last().unwrap();
+        let (_, topics, data) = events.last().unwrap();
         assert_eq!(
             topics,
-            (Symbol::new(&env, "course_difficulty_set"), course_id.clone()).into_val(&env)
+            (
+                Symbol::new(&env, "course_difficulty_set"),
+                course_id.clone()
+            )
+                .into_val(&env)
         );
+        // Data: (difficulty,).
         let data_vec: soroban_sdk::Vec<soroban_sdk::Val> = data.into_val(&env);
-        assert_eq!(data_vec.len(), 2);
-        let data_course: Symbol = data_vec.get(0).unwrap().into_val(&env);
-        let data_difficulty: u32 = data_vec.get(1).unwrap().into_val(&env);
-        assert_eq!(data_course, course_id);
+        assert_eq!(data_vec.len(), 1);
+        let data_difficulty: u32 = data_vec.get(0).unwrap().into_val(&env);
         assert_eq!(data_difficulty, 2);
-        assert_eq!(*data, (2u32,).into_val(&env));
     }
 
     #[test]
     fn test_set_course_difficulty_requires_admin_auth() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
         let course_id = Symbol::new(&env, "rust_101");
 
@@ -4782,7 +5079,7 @@ mod tests {
     #[should_panic(expected = "course not found")]
     fn test_set_course_difficulty_panics_for_nonexistent_course() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4794,7 +5091,7 @@ mod tests {
     #[test]
     fn test_get_course_created_at_returns_timestamp_set_during_creation() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4810,7 +5107,7 @@ mod tests {
     #[test]
     fn test_course_created_at_timestamp_does_not_change_after_updates() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4819,24 +5116,33 @@ mod tests {
 
         // Update difficulty
         client.set_course_difficulty(&course_id, &1);
-        assert_eq!(client.get_course_created_at(&course_id), original_created_at);
+        assert_eq!(
+            client.get_course_created_at(&course_id),
+            original_created_at
+        );
 
         // Update tags
         let mut tags = Vec::new(&env);
         tags.push_back(Symbol::new(&env, "rust"));
         client.set_course_tags(&course_id, &tags);
-        assert_eq!(client.get_course_created_at(&course_id), original_created_at);
+        assert_eq!(
+            client.get_course_created_at(&course_id),
+            original_created_at
+        );
 
         // Update content hash
         client.set_course_content_hash(&course_id, &Symbol::new(&env, "hash1"));
-        assert_eq!(client.get_course_created_at(&course_id), original_created_at);
+        assert_eq!(
+            client.get_course_created_at(&course_id),
+            original_created_at
+        );
     }
 
     #[test]
     #[should_panic(expected = "course not found")]
     fn test_get_course_created_at_panics_for_nonexistent_course() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4846,7 +5152,7 @@ mod tests {
     #[test]
     fn test_get_course_created_at_is_read_only() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4872,7 +5178,7 @@ mod tests {
     #[test]
     fn test_update_course_version_increments_version() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4888,7 +5194,7 @@ mod tests {
     #[test]
     fn test_update_course_version_emits_event() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4898,17 +5204,25 @@ mod tests {
         client.update_course_version(&course_id, &new_version);
 
         let events = env.events().all();
-        let (_, topics, _data) = events.last().unwrap();
+        let (_, topics, data) = events.last().unwrap();
         assert_eq!(
             topics,
-            (Symbol::new(&env, "course_version_updated"),).into_val(&env)
+            (
+                Symbol::new(&env, "course_version_updated"),
+                course_id.clone()
+            )
+                .into_val(&env)
         );
+        let data_vec: soroban_sdk::Vec<soroban_sdk::Val> = data.into_val(&env);
+        assert_eq!(data_vec.len(), 1);
+        let new_version_val: u32 = data_vec.get(0).unwrap().into_val(&env);
+        assert_eq!(new_version_val, new_version);
     }
 
     #[test]
     fn test_update_course_version_requires_admin_auth() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
         let course_id = Symbol::new(&env, "rust_101");
 
@@ -4920,7 +5234,7 @@ mod tests {
     #[should_panic(expected = "course not found")]
     fn test_update_course_version_panics_for_nonexistent_course() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4930,7 +5244,7 @@ mod tests {
     #[test]
     fn test_update_course_version_multiple_increments_accumulate() {
         let env = Env::default();
-        let (_admin, contract_id) = setup_contract(&env);
+        let (admin, contract_id) = setup_contract(&env);
         let client = ProgressTrackerClient::new(&env, &contract_id);
 
         env.mock_all_auths();
@@ -4944,5 +5258,183 @@ mod tests {
             assert_eq!(current_version, initial_version + i);
         }
     }
-}
 
+    // ── Issue #551: RBAC role enforcement ──────────────────────────────
+
+    #[test]
+    fn test_has_role_returns_false_before_grant() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+        env.mock_all_auths();
+
+        let pauser = Address::generate(&env);
+        assert!(!client.has_role(&pauser, &AdminRole::Pauser));
+    }
+
+    #[test]
+    fn test_grant_role_enables_has_role() {
+        let env = Env::default();
+        let (admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+        env.mock_all_auths();
+
+        let pauser = Address::generate(&env);
+        client.grant_role(&admin, &pauser, &AdminRole::Pauser);
+        assert!(client.has_role(&pauser, &AdminRole::Pauser));
+    }
+
+    #[test]
+    fn test_revoke_role_removes_has_role() {
+        let env = Env::default();
+        let (admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+        env.mock_all_auths();
+
+        let pauser = Address::generate(&env);
+        client.grant_role(&admin, &pauser, &AdminRole::Pauser);
+        assert!(client.has_role(&pauser, &AdminRole::Pauser));
+
+        client.revoke_role(&admin, &pauser, &AdminRole::Pauser);
+        assert!(!client.has_role(&pauser, &AdminRole::Pauser));
+    }
+
+    #[test]
+    fn test_admin_has_all_roles_by_default() {
+        let env = Env::default();
+        let (admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+
+        assert!(client.has_role(&admin, &AdminRole::Admin));
+        assert!(client.has_role(&admin, &AdminRole::Minter));
+        assert!(client.has_role(&admin, &AdminRole::Pauser));
+    }
+
+    #[test]
+    fn test_pause_requires_pauser_role() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+        env.mock_all_auths();
+
+        let nobody = Address::generate(&env);
+        assert!(client.try_pause(&nobody).is_err());
+    }
+
+    #[test]
+    fn test_unpause_requires_pauser_role() {
+        let env = Env::default();
+        let (admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+        env.mock_all_auths();
+
+        client.pause(&admin);
+        let nobody = Address::generate(&env);
+        assert!(client.try_unpause(&nobody).is_err());
+    }
+
+    #[test]
+    fn test_pauser_can_pause_and_unpause() {
+        let env = Env::default();
+        let (admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+        env.mock_all_auths();
+
+        let pauser = Address::generate(&env);
+        client.grant_role(&admin, &pauser, &AdminRole::Pauser);
+
+        client.pause(&pauser);
+        env.as_contract(&contract_id, || {
+            assert!(env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&ProgressTrackerDataKey::Paused)
+                .unwrap_or(false));
+        });
+
+        client.unpause(&pauser);
+        env.as_contract(&contract_id, || {
+            assert!(!env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&ProgressTrackerDataKey::Paused)
+                .unwrap_or(false));
+        });
+    }
+
+    #[test]
+    fn test_admin_can_pause_without_explicit_pauser_grant() {
+        let env = Env::default();
+        let (admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+        env.mock_all_auths();
+
+        client.pause(&admin);
+        env.as_contract(&contract_id, || {
+            assert!(env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&ProgressTrackerDataKey::Paused)
+                .unwrap_or(false));
+        });
+    }
+
+    #[test]
+    fn test_upgrade_requires_admin_role() {
+        let env = Env::default();
+        let (_admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+        env.mock_all_auths();
+
+        let nobody = Address::generate(&env);
+        let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+        assert!(client.try_upgrade(&nobody, &wasm_hash).is_err());
+    }
+
+    #[test]
+    fn test_non_admin_cannot_grant_role() {
+        let env = Env::default();
+        let (admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+        env.mock_all_auths();
+
+        let pauser = Address::generate(&env);
+        let other = Address::generate(&env);
+        client.grant_role(&admin, &pauser, &AdminRole::Pauser);
+        // pauser cannot grant roles (not an Admin)
+        assert!(client
+            .try_grant_role(&pauser, &other, &AdminRole::Pauser)
+            .is_err());
+    }
+
+    #[test]
+    fn test_non_admin_cannot_revoke_role() {
+        let env = Env::default();
+        let (admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+        env.mock_all_auths();
+
+        let pauser = Address::generate(&env);
+        client.grant_role(&admin, &pauser, &AdminRole::Pauser);
+        let nobody = Address::generate(&env);
+        // nobody cannot revoke roles
+        assert!(client
+            .try_revoke_role(&nobody, &pauser, &AdminRole::Pauser)
+            .is_err());
+    }
+
+    #[test]
+    fn test_admin_role_holder_can_grant_roles() {
+        let env = Env::default();
+        let (admin, contract_id) = setup_contract(&env);
+        let client = ProgressTrackerClient::new(&env, &contract_id);
+        env.mock_all_auths();
+
+        let sub_admin = Address::generate(&env);
+        let pauser = Address::generate(&env);
+        client.grant_role(&admin, &sub_admin, &AdminRole::Admin);
+        // sub_admin can now grant Pauser to another address
+        client.grant_role(&sub_admin, &pauser, &AdminRole::Pauser);
+        assert!(client.has_role(&pauser, &AdminRole::Pauser));
+    }
+}
